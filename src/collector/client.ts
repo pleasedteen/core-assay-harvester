@@ -95,9 +95,52 @@ export interface SignedClientOptions {
   maxAttempts?: number;
   requestTimeoutMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Cooldown shared by every session of one collection; see RateLimitGate. */
+  gate?: RateLimitGate;
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const MAX_RETRY_AFTER_MS = 60_000;
+
+/**
+ * One cooldown shared by every session of a single collection.
+ *
+ * The site rate-limits requests, not sessions: when any session is told to
+ * retry after N ms, every session must hold its *next* request until that
+ * deadline. Requests already on the wire are unaffected and may finish
+ * normally. A later 429 can only extend the deadline, never shorten it.
+ */
+export class RateLimitGate {
+  private resumeAt = 0;
+  private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
+
+  constructor(options: { now?: () => number; sleep?: (ms: number) => Promise<void> } = {}) {
+    this.now = options.now ?? Date.now;
+    this.sleep = options.sleep ?? defaultSleep;
+  }
+
+  /** Record a rate-limit response and block every later request until it expires. */
+  async block(retryAfterMs: number): Promise<void> {
+    const delay = Number.isFinite(retryAfterMs) ? retryAfterMs : 0;
+    const until = this.now() + Math.min(MAX_RETRY_AFTER_MS, Math.max(0, delay));
+    if (until > this.resumeAt) this.resumeAt = until;
+    await this.wait();
+  }
+
+  /** Wait out the current cooldown, if any. Called before signing each request. */
+  async wait(): Promise<void> {
+    while (this.resumeAt > this.now()) {
+      await this.sleep(this.resumeAt - this.now());
+    }
+  }
+
+  /** Milliseconds until requests may resume (0 when open). */
+  remainingMs(): number {
+    return Math.max(0, this.resumeAt - this.now());
+  }
+}
 
 /**
  * A session-bound client. Each request is signed with
@@ -114,6 +157,7 @@ export class SignedClient {
   private readonly maxAttempts: number;
   private readonly requestTimeoutMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
+  readonly gate: RateLimitGate;
 
   constructor(options: SignedClientOptions) {
     this.baseUrl = normalizeBaseUrl(options.baseUrl);
@@ -121,6 +165,7 @@ export class SignedClient {
     this.maxAttempts = options.maxAttempts ?? 8;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 5_000;
     this.sleep = options.sleep ?? defaultSleep;
+    this.gate = options.gate ?? new RateLimitGate({ sleep: this.sleep });
   }
 
   /** Bootstrap an unsigned directory request and adopt its session and snapshot. */
@@ -142,6 +187,7 @@ export class SignedClient {
     let response: Response | null = null;
     let lastFailure = "";
     for (let attempt = 0; attempt < 4; attempt++) {
+      await this.gate.wait();
       try {
         response = await fetch(url, {
           method: "GET",
@@ -157,7 +203,7 @@ export class SignedClient {
       if (response.status === 429) {
         const retryMs = Math.min(2_000, Math.max(50, Number(response.headers.get(RETRY_AFTER_MS_HEADER)) || 150));
         lastFailure = "Directory request was rate limited";
-        await this.sleep(retryMs);
+        await this.gate.block(retryMs);
         response = null;
         continue;
       }
@@ -224,6 +270,10 @@ export class SignedClient {
       }
 
       const targetPath = `${target.pathname}${target.search}`;
+      // Hold every session (not just this one) until a site-wide cooldown
+      // caused by any rate-limit response has elapsed. Requests already sent
+      // are not cancelled and may complete normally.
+      await this.gate.wait();
       const signature = computeSignature(this.sessionId!, this.nonce!, "GET", targetPath);
       let response: Response;
       try {
@@ -278,8 +328,9 @@ export class SignedClient {
         const retryHeader = response.headers.get(RETRY_AFTER_MS_HEADER);
         const retryMs = Math.min(2_000, Math.max(50, Number(retryHeader) || 150));
         lastError = new SiteFetchError("Rate limited", "http", 429, "rate_limited");
-        await this.sleep(retryMs);
-        continue; // nonce is untouched by a rate-limited request
+        // The whole collection pauses; the nonce is untouched by a 429.
+        await this.gate.block(retryMs);
+        continue;
       }
 
       const code = errorCode(bodyText);

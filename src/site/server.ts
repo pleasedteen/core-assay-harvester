@@ -37,6 +37,8 @@ interface Fault {
   type: FaultType;
   /** Optional substring the request path must contain. */
   matchPath?: string;
+  /** Optional substring the request path must *not* contain (e.g. "/appendix"). */
+  excludePath?: string;
   /** How many matching requests the fault applies to (default 1). */
   times?: number;
   /** Remaining applications; initialised from `times`. */
@@ -74,6 +76,8 @@ interface SiteSession {
 
 interface RequestLogEntry {
   at: string;
+  /** When the request arrived at the site (before any injected delay). */
+  receivedAt: string;
   method: string;
   url: string;
   status: number;
@@ -114,6 +118,7 @@ export class MockAssaySite {
   private readonly tokens = new Map<string, TokenRecord>();
   private readonly faults: Fault[] = [];
   private readonly requests: RequestLogEntry[] = [];
+  private readonly receivedAtMs = new WeakMap<IncomingMessage, number>();
   private signedCounter = 0;
   private readonly corruptedReports = new Map<string, number>();
   private readonly unavailableReports = new Map<string, number>();
@@ -181,8 +186,9 @@ export class MockAssaySite {
     return this.snapshotById(this.currentSnapshotId)!;
   }
 
-  private log(entry: Omit<RequestLogEntry, "at">): void {
-    this.requests.push({ at: new Date().toISOString(), ...entry });
+  private log(req: IncomingMessage, entry: Omit<RequestLogEntry, "at" | "receivedAt">): void {
+    const receivedAtMs = this.receivedAtMs.get(req) ?? Date.now();
+    this.requests.push({ at: new Date().toISOString(), receivedAt: new Date(receivedAtMs).toISOString(), ...entry });
     if (this.requests.length > REQUEST_LOG_LIMIT) this.requests.splice(0, this.requests.length - REQUEST_LOG_LIMIT);
   }
 
@@ -199,11 +205,16 @@ export class MockAssaySite {
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Remember arrival time before injected delays, so tests and operators can
+    // tell a slow response from a late request.
+    this.receivedAtMs.set(req, Date.now());
     const url = new URL(req.url ?? "/", "http://site.local");
     const path = url.pathname;
     try {
       const delayFault = this.faults.find(
-        (fault) => fault.type === "delay" && (!fault.matchPath || path.includes(fault.matchPath)),
+        (fault) =>
+          fault.type === "delay" &&
+          pathMatches(fault, path),
       );
       if (delayFault) {
         delayFault.remaining = (delayFault.remaining ?? 1) - 1;
@@ -232,7 +243,7 @@ export class MockAssaySite {
         this.handleBody(req, res, url, decodeURIComponent(reportMatch[1]!));
         return;
       }
-      this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 404, sessionId: null, snapshotId: null, note: "not_found" });
+      this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 404, sessionId: null, snapshotId: null, note: "not_found" });
       res.writeHead(404, { "content-type": "text/html; charset=utf-8" });
       res.end(renderErrorPage("页面不存在", "请求的页面不存在。"));
     } catch (error) {
@@ -259,21 +270,21 @@ export class MockAssaySite {
       }
       const snapshot = auth.snapshot;
       const html = renderIndex(snapshot.id, snapshot.revisions);
-      this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 200, sessionId: auth.session.id, snapshotId: snapshot.id, note: "index" });
+      this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 200, sessionId: auth.session.id, snapshotId: snapshot.id, note: "index" });
       this.respondHtml(res, html, auth.session, snapshot);
       return;
     }
     const requested = url.searchParams.get("snapshot") ?? undefined;
     const snapshot = requested ? this.snapshotById(requested) : this.currentSnapshot();
     if (!snapshot) {
-      this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 404, sessionId: null, snapshotId: null, note: "unknown_snapshot" });
+      this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 404, sessionId: null, snapshotId: null, note: "unknown_snapshot" });
       res.writeHead(404, { "content-type": "text/html; charset=utf-8" });
       res.end(renderErrorPage("快照不存在", `未找到历史快照 ${requested ?? ""}。`));
       return;
     }
     const session = this.createSession(snapshot.id);
     const html = renderIndex(snapshot.id, snapshot.revisions);
-    this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: "index" });
+    this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: "index" });
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
@@ -334,20 +345,20 @@ export class MockAssaySite {
           [SNAPSHOT_HEADER]: session?.snapshotId ?? "",
         },
       );
-      this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 429, sessionId: session?.id ?? null, snapshotId: session?.snapshotId ?? null, note: "fault_rate_limit" });
+      this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 429, sessionId: session?.id ?? null, snapshotId: session?.snapshotId ?? null, note: "fault_rate_limit" });
       return null;
     }
 
     if (!session) {
       this.sendJson(res, 401, { error: "unknown_session", message: "会话无效，请重新进入目录。" });
-      this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 401, sessionId: null, snapshotId: null, note: "unknown_session" });
+      this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 401, sessionId: null, snapshotId: null, note: "unknown_session" });
       return null;
     }
 
     const snapshot = this.snapshotById(session.snapshotId);
     if (!snapshot) {
       this.sendJson(res, 410, { error: "snapshot_gone", message: "会话绑定的快照已不可用。" });
-      this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 410, sessionId: session.id, snapshotId: session.snapshotId, note: "snapshot_gone" });
+      this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 410, sessionId: session.id, snapshotId: session.snapshotId, note: "snapshot_gone" });
       return null;
     }
 
@@ -356,13 +367,13 @@ export class MockAssaySite {
       this.sendJson(res, 403, { error: "session_banned", message: "会话已被封禁，请重新建立会话。" }, {
         [SNAPSHOT_HEADER]: session.snapshotId,
       });
-      this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 403, sessionId: session.id, snapshotId: session.snapshotId, note: "fault_ban_session" });
+      this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 403, sessionId: session.id, snapshotId: session.snapshotId, note: "fault_ban_session" });
       return null;
     }
 
     if (session.banned) {
       this.sendJson(res, 403, { error: "session_banned", message: "会话已被封禁，请重新建立会话。" });
-      this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 403, sessionId: session.id, snapshotId: session.snapshotId, note: "session_banned" });
+      this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 403, sessionId: session.id, snapshotId: session.snapshotId, note: "session_banned" });
       return null;
     }
 
@@ -373,7 +384,7 @@ export class MockAssaySite {
 
     if (!nonce || !signature) {
       this.sendJson(res, 401, { error: "signature_required", message: "缺少会话签名。" });
-      this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 401, sessionId: session.id, snapshotId: session.snapshotId, note: "missing_signature" });
+      this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 401, sessionId: session.id, snapshotId: session.snapshotId, note: "missing_signature" });
       return null;
     }
 
@@ -383,7 +394,7 @@ export class MockAssaySite {
     const signatureOk = safeEqual(signature, expectedSignature);
     if (!nonceOk || !signatureOk) {
       this.sendJson(res, 401, { error: "bad_signature", message: "签名校验失败或凭证已过期。" });
-      this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 401, sessionId: session.id, snapshotId: session.snapshotId, note: "bad_signature" });
+      this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 401, sessionId: session.id, snapshotId: session.snapshotId, note: "bad_signature" });
       return null;
     }
 
@@ -405,7 +416,7 @@ export class MockAssaySite {
     session: SiteSession,
     snapshot: Snapshot,
   ): void {
-    this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 0, sessionId: session.id, snapshotId: snapshot.id, note: "fault_drop_response" });
+    this.log(req, { method: req.method ?? "GET", url: req.url ?? "", status: 0, sessionId: session.id, snapshotId: snapshot.id, note: "fault_drop_response" });
     setTimeout(() => {
       res.socket?.destroy();
     }, 5);
@@ -413,7 +424,7 @@ export class MockAssaySite {
 
   private takeFault(pathname: string): Fault | null {
     const index = this.faults.findIndex(
-      (fault) => fault.type !== "corruptReport" && (!fault.matchPath || pathname.includes(fault.matchPath)),
+      (fault) => fault.type !== "corruptReport" && pathMatches(fault, pathname),
     );
     if (index < 0) return null;
     const fault = this.faults[index]!;
@@ -432,7 +443,7 @@ export class MockAssaySite {
         [SNAPSHOT_HEADER]: snapshot.id,
         [NONCE_HEADER]: session.nonce,
       });
-      this.log({ method: "GET", url: req.url ?? "", status: 404, sessionId: session.id, snapshotId: snapshot.id, note: "report_not_in_snapshot" });
+      this.log(req, { method: "GET", url: req.url ?? "", status: 404, sessionId: session.id, snapshotId: snapshot.id, note: "report_not_in_snapshot" });
       return;
     }
 
@@ -444,7 +455,7 @@ export class MockAssaySite {
         [SNAPSHOT_HEADER]: snapshot.id,
         [NONCE_HEADER]: session.nonce,
       });
-      this.log({ method: "GET", url: req.url ?? "", status: 404, sessionId: session.id, snapshotId: snapshot.id, note: "fault_unavailable" });
+      this.log(req, { method: "GET", url: req.url ?? "", status: 404, sessionId: session.id, snapshotId: snapshot.id, note: "fault_unavailable" });
       return;
     }
 
@@ -453,7 +464,7 @@ export class MockAssaySite {
       if (corruptRemaining === 1) this.corruptedReports.delete(reportNo);
       else this.corruptedReports.set(reportNo, corruptRemaining - 1);
       const html = renderErrorPage(`${reportNo} 报告正文`, "内容暂时无法提供。");
-      this.log({ method: "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: "fault_corrupt" });
+      this.log(req, { method: "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: "fault_corrupt" });
       res.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
         "cache-control": "no-store",
@@ -478,7 +489,7 @@ export class MockAssaySite {
       this.dropResponse(req, res, session, snapshot);
       return;
     }
-    this.log({ method: "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: "report_body" });
+    this.log(req, { method: "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: "report_body" });
     this.respondHtml(res, html, session, snapshot);
   }
 
@@ -499,7 +510,7 @@ export class MockAssaySite {
         [SNAPSHOT_HEADER]: snapshot.id,
         [NONCE_HEADER]: session.nonce,
       });
-      this.log({ method: "GET", url: req.url ?? "", status: 400, sessionId: session.id, snapshotId: snapshot.id, note: "token_required" });
+      this.log(req, { method: "GET", url: req.url ?? "", status: 400, sessionId: session.id, snapshotId: snapshot.id, note: "token_required" });
       return;
     }
     const record = this.tokens.get(tokenValue);
@@ -508,7 +519,7 @@ export class MockAssaySite {
         [SNAPSHOT_HEADER]: snapshot.id,
         [NONCE_HEADER]: session.nonce,
       });
-      this.log({ method: "GET", url: req.url ?? "", status: 403, sessionId: session.id, snapshotId: snapshot.id, note: "bad_token" });
+      this.log(req, { method: "GET", url: req.url ?? "", status: 403, sessionId: session.id, snapshotId: snapshot.id, note: "bad_token" });
       return;
     }
     if (record.used) {
@@ -516,7 +527,7 @@ export class MockAssaySite {
         [SNAPSHOT_HEADER]: snapshot.id,
         [NONCE_HEADER]: session.nonce,
       });
-      this.log({ method: "GET", url: req.url ?? "", status: 409, sessionId: session.id, snapshotId: snapshot.id, note: "token_replayed" });
+      this.log(req, { method: "GET", url: req.url ?? "", status: 409, sessionId: session.id, snapshotId: snapshot.id, note: "token_replayed" });
       return;
     }
     if (record.reportNo !== reportNo || record.page !== page) {
@@ -524,7 +535,7 @@ export class MockAssaySite {
         [SNAPSHOT_HEADER]: snapshot.id,
         [NONCE_HEADER]: session.nonce,
       });
-      this.log({ method: "GET", url: req.url ?? "", status: 403, sessionId: session.id, snapshotId: snapshot.id, note: "bad_token_page" });
+      this.log(req, { method: "GET", url: req.url ?? "", status: 403, sessionId: session.id, snapshotId: snapshot.id, note: "bad_token_page" });
       return;
     }
     record.used = true;
@@ -535,7 +546,7 @@ export class MockAssaySite {
         [SNAPSHOT_HEADER]: snapshot.id,
         [NONCE_HEADER]: session.nonce,
       });
-      this.log({ method: "GET", url: req.url ?? "", status: 404, sessionId: session.id, snapshotId: snapshot.id, note: "report_not_in_snapshot" });
+      this.log(req, { method: "GET", url: req.url ?? "", status: 404, sessionId: session.id, snapshotId: snapshot.id, note: "report_not_in_snapshot" });
       return;
     }
 
@@ -547,7 +558,7 @@ export class MockAssaySite {
         [SNAPSHOT_HEADER]: snapshot.id,
         [NONCE_HEADER]: session.nonce,
       });
-      this.log({ method: "GET", url: req.url ?? "", status: 404, sessionId: session.id, snapshotId: snapshot.id, note: "page_not_found" });
+      this.log(req, { method: "GET", url: req.url ?? "", status: 404, sessionId: session.id, snapshotId: snapshot.id, note: "page_not_found" });
       return;
     }
     const nextToken = page < appendixPageCount(report) ? this.issueToken(session, reportNo, page + 1) : null;
@@ -564,7 +575,7 @@ export class MockAssaySite {
       this.dropResponse(req, res, session, snapshot);
       return;
     }
-    this.log({ method: "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: `appendix_${page}` });
+    this.log(req, { method: "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: `appendix_${page}` });
     this.respondHtml(res, html, session, snapshot);
   }
 
@@ -669,6 +680,7 @@ export class MockAssaySite {
         const fault: Fault = {
           type: body.type,
           matchPath: body.matchPath,
+          excludePath: body.excludePath,
           times: Math.max(1, body.times ?? 1),
           remaining: Math.max(1, body.times ?? 1),
           retryAfterMs: body.retryAfterMs,
@@ -689,6 +701,13 @@ export class MockAssaySite {
         this.sendJson(res, 404, { error: "unknown_control", path });
     }
   }
+}
+
+/** A fault applies when `matchPath` (if any) is present and `excludePath` (if any) is absent. */
+function pathMatches(fault: Fault, pathname: string): boolean {
+  if (fault.matchPath && !pathname.includes(fault.matchPath)) return false;
+  if (fault.excludePath && pathname.includes(fault.excludePath)) return false;
+  return true;
 }
 
 function safeEqual(left: string, right: string): boolean {

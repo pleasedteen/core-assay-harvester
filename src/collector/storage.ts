@@ -44,10 +44,15 @@ const RUN_STATE = "state.json";
 const DELIVERY_POINTER = "current-delivery.json";
 const TMP_SUFFIX = ".tmp";
 
+let tmpCounter = 0;
+
 async function writeFileAtomic(filePath: string, data: string | Buffer): Promise<void> {
   const dir = path.dirname(filePath);
   await fs.mkdir(dir, { recursive: true });
-  const tmp = `${filePath}.${process.pid}.${Date.now()}${TMP_SUFFIX}`;
+  // Unique per write: parallel report workers may save the run state in the
+  // same millisecond, and two writers must never share a temp file.
+  tmpCounter += 1;
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.${tmpCounter}${TMP_SUFFIX}`;
   const handle = await fs.open(tmp, "w");
   try {
     await handle.writeFile(data);
@@ -69,6 +74,8 @@ async function readJson<T>(filePath: string): Promise<T | null> {
 
 export class CollectorStore {
   readonly root: string;
+  /** Serialises state writes so concurrent workers cannot publish stale state. */
+  private saveChain: Promise<void> = Promise.resolve();
 
   constructor(root: string) {
     this.root = path.resolve(root);
@@ -92,7 +99,12 @@ export class CollectorStore {
 
   async saveRun(run: PersistedRun): Promise<void> {
     run.updatedAt = new Date().toISOString();
-    await writeFileAtomic(this.runFile(), `${JSON.stringify(run, null, 2)}\n`);
+    const snapshot = `${JSON.stringify(run, null, 2)}\n`;
+    // Queue behind any in-flight save; serialising (rather than racing) keeps
+    // the file an atomic snapshot of the newest state.
+    const write = this.saveChain.then(() => writeFileAtomic(this.runFile(), snapshot));
+    this.saveChain = write.catch(() => undefined);
+    await write;
   }
 
   /** Keep an immutable copy of a finished run before a new one replaces it. */

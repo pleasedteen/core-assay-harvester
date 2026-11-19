@@ -8,7 +8,11 @@ const host = process.env.COLLECTOR_HOST ?? "127.0.0.1";
 const port = Number(process.env.COLLECTOR_PORT ?? 4200);
 const dataDir = path.resolve(process.env.COLLECTOR_DATA_DIR ?? "data/collector");
 
-const collector = new Collector({ dataDir, siteUrl: process.env.SITE_URL ?? "http://127.0.0.1:4100" });
+const collector = new Collector({
+  dataDir,
+  siteUrl: process.env.SITE_URL ?? "http://127.0.0.1:4100",
+  concurrency: Number(process.env.COLLECTOR_CONCURRENCY ?? 1),
+});
 const service = await startCollectorService({ collector, host, port, dataDir });
 
 console.log(`[collector] listening on ${service.url}`);

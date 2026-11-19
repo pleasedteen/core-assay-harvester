@@ -7,6 +7,7 @@ import {
   TokenRejectedError,
   SiteFetchError,
   SessionLostError,
+  RateLimitGate,
   normalizeBaseUrl,
 } from "./client.js";
 import { mergeReportParts, ParseError, parsePage, type PagePart } from "./parse.js";
@@ -27,6 +28,8 @@ export interface CollectorOptions {
   snapshotId?: string | null;
   /** Per-report attempt budget (session loss, paging token rejection, transient errors). */
   reportAttempts?: number;
+  /** How many reports to collect concurrently (default 1 = strictly sequential). */
+  concurrency?: number;
 }
 
 export interface StartOptions {
@@ -35,6 +38,8 @@ export interface StartOptions {
   fresh?: boolean;
   /** Pin the new run to a specific snapshot (must exist on the site). */
   snapshotId?: string | null;
+  /** Override how many reports this run collects concurrently (1 = sequential). */
+  concurrency?: number;
 }
 
 export interface RunResult {
@@ -62,6 +67,7 @@ export class Collector {
     siteUrl: string;
     snapshotId: string | null;
     reportAttempts: number;
+    concurrency: number;
   };
   private activeRun: PersistedRun | null = null;
   private liveState: ProgressSnapshot["state"] | null = null;
@@ -69,6 +75,7 @@ export class Collector {
   private starting = false;
   private lastError: string | null = null;
   private readonly reportAttempts: number;
+  private readonly concurrency: number;
 
   constructor(options: CollectorOptions) {
     this.options = {
@@ -76,9 +83,11 @@ export class Collector {
       siteUrl: normalizeBaseUrl(options.siteUrl),
       snapshotId: options.snapshotId ?? null,
       reportAttempts: options.reportAttempts ?? 5,
+      concurrency: normalizeConcurrency(options.concurrency),
     };
     this.store = new CollectorStore(options.dataDir);
     this.reportAttempts = this.options.reportAttempts;
+    this.concurrency = this.options.concurrency;
   }
 
   get storeRef(): CollectorStore {
@@ -148,7 +157,8 @@ export class Collector {
     this.liveState = "running";
     this.lastError = null;
 
-    this.activePromise = this.execute(run)
+    const concurrency = normalizeConcurrency(options.concurrency ?? this.concurrency);
+    this.activePromise = this.execute(run, concurrency)
       .catch(async (error) => {
         const message = error instanceof Error ? error.message : String(error);
         run.state = "failed";
@@ -197,11 +207,14 @@ export class Collector {
     };
   }
 
-  private async execute(run: PersistedRun): Promise<RunResult> {
-    const client = new SignedClient({
-      baseUrl: run.siteUrl,
-      snapshotId: run.snapshotId,
-    });
+  private async execute(run: PersistedRun, concurrency: number): Promise<RunResult> {
+    // One cooldown shared by every session of this run: when any session is
+    // rate limited, all sessions hold their next request until the site's
+    // retry time. Requests already in flight are allowed to finish.
+    const gate = new RateLimitGate();
+    const makeClient = (): SignedClient =>
+      new SignedClient({ baseUrl: run.siteUrl, snapshotId: run.snapshotId, gate });
+    const client = makeClient();
     let directory;
     try {
       directory = await client.open();
@@ -243,42 +256,40 @@ export class Collector {
       }
     }
     run.expectedReports = directory.entries.length;
-    await this.store.saveRun(run);
 
+    // Any complete record already on disk for this snapshot/revision is
+    // trusted and never requested again. This also covers a crash between
+    // writing a report and persisting its status.
     for (const entry of run.entries) {
-      // Any complete record already on disk for this snapshot/revision is
-      // trusted and never requested again. This also covers a crash between
-      // writing a report and persisting its status.
+      if (entry.status === "missing") continue;
       const stored = await this.store.readReport(run.snapshotId, entry.reportNo, entry.revision);
       if (stored) {
-        const wasDelivered = entry.status === "delivered";
         entry.status = "delivered";
         entry.sampleCount = stored.samples.length;
         delete entry.reason;
-        if (!wasDelivered) await this.store.saveRun(run);
-        continue;
-      }
-      if (entry.status === "delivered") {
+      } else if (entry.status === "delivered") {
         entry.status = "pending";
-        await this.store.saveRun(run);
       }
-
-      try {
-        const record = await this.collectReport(client, run, entry);
-        await this.store.writeReport(run.snapshotId, record);
-        entry.status = "delivered";
-        entry.sampleCount = record.samples.length;
-        delete entry.reason;
-      } catch (error) {
-        if (error instanceof CollectAborted) throw error;
-        const { status, reason } = classifyFailure(error);
-        entry.status = status;
-        entry.reason = reason;
-        this.lastError = `${entry.reportNo}: ${reason}`;
-        run.lastError = this.lastError;
-      }
-      await this.store.saveRun(run);
     }
+    await this.store.saveRun(run);
+
+    // Work through the queue with N independent sessions. Each worker owns its
+    // own session, so losing (or banning) one session only affects the report
+    // that worker is currently fetching: every other session keeps going and
+    // every already-persisted report stays as it is.
+    const queue = run.entries.filter((entry) => entry.status === "pending");
+    let cursor = 0;
+    const nextEntry = (): RunEntry | null => (cursor < queue.length ? queue[cursor++]! : null);
+    const aborted: { error: unknown | null } = { error: null };
+    const workerCount = Math.max(1, Math.min(concurrency, queue.length));
+    const workers: Array<Promise<void>> = [];
+    for (let worker = 0; worker < workerCount; worker++) {
+      // The first worker reuses the session opened for the directory request.
+      const workerClient = worker === 0 ? client : makeClient();
+      workers.push(this.collectWorker(workerClient, run, nextEntry, aborted));
+    }
+    await Promise.all(workers);
+    if (aborted.error) throw aborted.error;
 
     const delivered = run.entries.filter((entry) => entry.status === "delivered");
     const problems = run.entries.filter(
@@ -315,6 +326,40 @@ export class Collector {
       );
     }
     return this.resultFromRun(run, true);
+  }
+
+  /**
+   * One session pulling reports off the shared queue until it is empty.
+   * State writes are serialised so concurrent workers never interleave.
+   */
+  private async collectWorker(
+    client: SignedClient,
+    run: PersistedRun,
+    nextEntry: () => RunEntry | null,
+    aborted: { error: unknown | null },
+  ): Promise<void> {
+    while (!aborted.error) {
+      const entry = nextEntry();
+      if (!entry) return;
+      try {
+        const record = await this.collectReport(client, run, entry);
+        await this.store.writeReport(run.snapshotId, record);
+        entry.status = "delivered";
+        entry.sampleCount = record.samples.length;
+        delete entry.reason;
+      } catch (error) {
+        if (error instanceof CollectAborted) {
+          aborted.error ??= error;
+          return;
+        }
+        const { status, reason } = classifyFailure(error);
+        entry.status = status;
+        entry.reason = reason;
+        run.lastError = `${entry.reportNo}: ${reason}`;
+        this.lastError = run.lastError;
+      }
+      await this.store.saveRun(run);
+    }
   }
 
   /** Fetch body + all appendices, retrying the whole report when its session/token is invalidated. */
@@ -437,6 +482,13 @@ function classifyFailure(error: unknown): { status: Exclude<EntryStatus, "pendin
 
 function isPermanentFetchError(error: unknown): boolean {
   return error instanceof SiteFetchError && error.status !== null && error.status >= 400 && error.status < 500;
+}
+
+/** A positive, finite integer; anything else means "collect sequentially". */
+function normalizeConcurrency(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 1;
+  const rounded = Math.floor(value);
+  return rounded >= 1 ? rounded : 1;
 }
 
 function describe(error: unknown): string {

@@ -327,8 +327,8 @@ describe("recovery", () => {
 describe("snapshots and layout", () => {
   test("a revision published mid-collection does not mix into the pinned snapshot", async () => {
     const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
-    // Slow down a later report so the publication lands mid-run.
-    await armFault(h.site.url, { type: "delay", matchPath: "/reports/R-0005", ms: 250, times: 2 });
+    // Slow down a report so the publication lands mid-run.
+    await armFault(h.site.url, { type: "delay", matchPath: "/reports/R-0006", ms: 250, times: 1 });
 
     await startCollect(h.service.url, h.site.url);
     await waitUntil(async () => {
@@ -560,8 +560,179 @@ describe("process restart", () => {
   });
 });
 
+describe("parallel collection", () => {
+  test("default is one lane; three lanes finish within two thirds of the single-lane time", async () => {
+    const delayAll = { type: "delay", matchPath: "/reports/R-", excludePath: "/appendix", ms: 200, times: 400 };
+
+    // Single lane (the default: no concurrency configured, no request option).
+    const serial = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    await armFault(serial.site.url, delayAll);
+    const serialMs = await timeCollection(serial);
+    assert.equal((await download(serial.service.url)).records.length, 6);
+
+    // Default really is sequential: every request arrives after the previous
+    // one's response was logged, so no two requests are ever in flight.
+    const serialRequests = reportRequests(await siteRequests(serial.site.url));
+    assert.ok(serialRequests.length >= 12, "expected body + appendix requests");
+    for (let i = 1; i < serialRequests.length; i++) {
+      assert.ok(
+        Date.parse(serialRequests[i]!.receivedAt) >= Date.parse(serialRequests[i - 1]!.at) - 5,
+        `request ${i} started before request ${i - 1} finished`,
+      );
+    }
+    assert.equal(maxInFlight(serialRequests), 1, "single lane must never overlap requests");
+
+    // Three lanes.
+    const parallel = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    await armFault(parallel.site.url, delayAll);
+    const parallelMs = await timeCollection(parallel, { concurrency: 3 });
+    const parallelResult = await download(parallel.service.url);
+    assert.equal(parallelResult.records.length, 6);
+    assertNoDuplicateReports(parallelResult.records);
+    const parallelProgress = (await getProgress(parallel.service.url)).progress;
+    for (const record of parallelResult.records) {
+      assert.equal(record.snapshotId, parallelProgress.snapshotId);
+      assert.ok(record.samples.length >= 2);
+    }
+
+    const parallelRequests = reportRequests(await siteRequests(parallel.site.url));
+    assert.ok(maxInFlight(parallelRequests) >= 2, "three lanes must overlap requests");
+    // Same fixed per-request delay, so the speedup comes from concurrency alone.
+    assert.ok(
+      parallelMs <= (serialMs * 2) / 3,
+      `three lanes took ${parallelMs}ms, single lane ${serialMs}ms (limit ${Math.round((serialMs * 2) / 3)}ms)`,
+    );
+  });
+
+  test("a rate limit pauses every session until the site's retry time while in-flight requests finish", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    await armFault(h.site.url, { type: "delay", matchPath: "/reports/R-", excludePath: "/appendix", ms: 120, times: 400 });
+    const retryAfterMs = 400;
+    await armFault(h.site.url, { type: "rateLimit", matchPath: "/reports/R-0002", retryAfterMs, times: 1 });
+
+    await startCollect(h.service.url, h.site.url, { concurrency: 3 });
+    const progress = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(progress.state, "complete", progress.lastError ?? "");
+    assert.equal(progress.deliveredReports, 6);
+    const result = await download(h.service.url);
+    assert.equal(result.records.length, 6);
+    assertNoDuplicateReports(result.records);
+
+    const requests = await siteRequests(h.site.url);
+    const limited = requests.find((request) => request.status === 429);
+    assert.ok(limited, "rate limit must fire");
+    const limitedAt = Date.parse(limited.receivedAt);
+    // The 429 is sent some ms after it arrives; anything the client dispatched
+    // before it could observe the 429 counts as already in flight.
+    const sentAt = Date.parse(limited.at);
+    const graceMs = 75;
+
+    for (const request of requests) {
+      const receivedAt = Date.parse(request.receivedAt);
+      if (receivedAt <= sentAt + graceMs) continue;
+      assert.ok(
+        receivedAt >= limitedAt + retryAfterMs - 25,
+        `${request.url} was sent ${receivedAt - limitedAt}ms after the 429, before the ${retryAfterMs}ms retry time`,
+      );
+    }
+    // Requests did land after the cooldown, i.e. the run resumed rather than
+    // silently dropping work.
+    assert.ok(
+      requests.some((request) => Date.parse(request.receivedAt) >= limitedAt + retryAfterMs - 25),
+      "collection must resume after the retry time",
+    );
+
+    // More than one session existed, and all of them respected the cooldown.
+    const sessionsAfter = new Set(requests.filter((request) => request.sessionId).map((request) => request.sessionId));
+    assert.ok(sessionsAfter.size >= 2, "three lanes use independent sessions");
+    // The limited request itself was retried only after the cooldown.
+    const limitedRetry = requests.find(
+      (request) =>
+        request.url.startsWith("/reports/R-0002") &&
+        request.status === 200 &&
+        Date.parse(request.receivedAt) > limitedAt,
+    );
+    assert.ok(limitedRetry, "the rate-limited request must succeed on retry");
+  });
+
+  test("session invalidation only recollects the affected report", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    await armFault(h.site.url, { type: "banSession", matchPath: "/reports/R-0003" });
+
+    await startCollect(h.service.url, h.site.url, { concurrency: 3 });
+    const progress = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(progress.state, "complete", progress.lastError ?? "");
+    assert.equal(progress.deliveredReports, 6);
+
+    const result = await download(h.service.url);
+    assert.equal(result.records.length, 6);
+    assertNoDuplicateReports(result.records);
+    for (const record of result.records) {
+      assert.equal(record.revision, 1);
+      assert.ok(record.samples.length >= 2);
+    }
+
+    const requests = await siteRequests(h.site.url);
+    const banned = requests.filter((request) => request.note === "fault_ban_session");
+    assert.equal(banned.length, 1, "ban fault must fire exactly once");
+    assert.match(banned[0]!.url, /^\/reports\/R-0003/);
+    // Only the report whose request hit the ban is touched again; the other
+    // sessions keep their work (and their persisted results).
+    const counts = bodyRequestCounts(requests);
+    assert.equal(counts.size, 6);
+    for (const [reportNo, count] of counts) {
+      assert.equal(count, 1, `${reportNo} body fetched ${count} times`);
+    }
+    const r3Requests = requests.filter((request) => request.url.startsWith("/reports/R-0003"));
+    assert.equal(r3Requests.length, 2, "the banned report restarts from its body once");
+    assert.ok(
+      h.site.state().sessions.filter((session) => session.snapshotId === progress.snapshotId).length >= 2,
+      "a replacement session must stay bound to the pinned snapshot",
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 // helpers local to this file
+
+async function timeCollection(
+  h: Harness,
+  options: { concurrency?: number } = {},
+): Promise<number> {
+  const start = performance.now();
+  const response = await startCollect(h.service.url, h.site.url, options);
+  assert.equal(response.status, 202);
+  const progress = await waitForState(h.service.url, ["complete", "failed"], 30_000);
+    const elapsed = performance.now() - start;
+    assert.equal(progress.state, "complete", progress.lastError ?? "");
+    assert.equal(progress.deliveredReports, 6);
+    return elapsed;
+  }
+
+function reportRequests(
+  requests: Array<{ url: string; note: string; at: string; receivedAt: string }>,
+): Array<{ url: string; note: string; at: string; receivedAt: string }> {
+  return requests.filter((request) => request.url.split("?")[0]!.startsWith("/reports/R-"));
+}
+
+/** Peak number of requests whose [receivedAt, at] windows overlap. */
+function maxInFlight(
+  requests: Array<{ at: string; receivedAt: string }>,
+): number {
+  const events: Array<{ time: number; delta: number }> = [];
+  for (const request of requests) {
+    events.push({ time: Date.parse(request.receivedAt), delta: 1 });
+    events.push({ time: Date.parse(request.at), delta: -1 });
+  }
+  events.sort((left, right) => left.time - right.time || left.delta - right.delta);
+  let inFlight = 0;
+  let peak = 0;
+  for (const event of events) {
+    inFlight += event.delta;
+    peak = Math.max(peak, inFlight);
+  }
+  return peak;
+}
 
 async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;

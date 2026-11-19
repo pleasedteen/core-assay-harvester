@@ -127,6 +127,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, collector: Coll
       }
       const snapshotId = typeof body.snapshotId === "string" ? body.snapshotId : null;
       const fresh = body.fresh === true;
+      let concurrency: number | undefined;
+      if (body.concurrency !== undefined) {
+        concurrency = typeof body.concurrency === "number" ? body.concurrency : Number.NaN;
+        if (!Number.isInteger(concurrency) || concurrency < 1) {
+          sendError(res, 400, "invalid_concurrency", "concurrency must be a positive integer");
+          return;
+        }
+      }
 
       const progress = collector.progress();
       if (collector.isRunning()) {
@@ -139,7 +147,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, collector: Coll
       }
 
       try {
-        const { runId } = await collector.start({ siteUrl, fresh, snapshotId });
+        const { runId } = await collector.start({ siteUrl, fresh, snapshotId, concurrency });
         void collector.wait();
         const current = collector.progress();
         sendJson(res, 202, {

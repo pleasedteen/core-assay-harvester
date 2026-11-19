@@ -26,10 +26,15 @@ export interface Harness {
 export async function startHarness(
   siteOptions: SiteOptions = {},
   dataDir?: string,
+  collectorOptions: { concurrency?: number } = {},
 ): Promise<Harness> {
   const site = await MockAssaySite.start(siteOptions);
   const dir = dataDir ?? (await tempDataDir());
-  const collector = new Collector({ dataDir: dir, siteUrl: site.url });
+  const collector = new Collector({
+    dataDir: dir,
+    siteUrl: site.url,
+    concurrency: collectorOptions.concurrency,
+  });
   const service = await startCollectorService({ collector, dataDir: dir });
   const ownsDataDir = dataDir === undefined;
   return {
@@ -47,7 +52,7 @@ export async function startHarness(
 export async function startCollect(
   serviceUrl: string,
   siteUrl: string,
-  options: { fresh?: boolean; snapshotId?: string } = {},
+  options: { fresh?: boolean; snapshotId?: string; concurrency?: number } = {},
 ): Promise<Response> {
   return fetch(`${serviceUrl}/api/collect`, {
     method: "POST",
@@ -130,11 +135,27 @@ export async function publish(
 }
 
 export async function siteRequests(siteUrl: string): Promise<
-  Array<{ status: number; note: string; url: string; sessionId: string | null; snapshotId: string | null }>
+  Array<{
+    status: number;
+    note: string;
+    url: string;
+    sessionId: string | null;
+    snapshotId: string | null;
+    at: string;
+    receivedAt: string;
+  }>
 > {
   const response = await fetch(`${siteUrl}/__control/requests`);
   const payload = (await response.json()) as {
-    requests: Array<{ status: number; note: string; url: string; sessionId: string | null; snapshotId: string | null }>;
+    requests: Array<{
+      status: number;
+      note: string;
+      url: string;
+      sessionId: string | null;
+      snapshotId: string | null;
+      at: string;
+      receivedAt: string;
+    }>;
   };
   return payload.requests;
 }

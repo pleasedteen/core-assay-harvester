@@ -5,8 +5,9 @@
 - 站点与采集器都是真实 HTTP 服务，签名、一次性翻页凭证、限流、封禁会话、响应中断都在服务端真实校验/注入。
 - 站点是纯本地、确定性内容生成器（固定种子），不访问任何外网，也不依赖时间或随机数来决定报告内容。
 - 采集结果以快照为单位物化，进程被杀后可用同一数据目录继续，已完整落盘的报告不会再请求。
+- 报告采集支持配置并行路数（默认单路），每路使用独立会话；限流是所有会话共享的冷却，会话失效只影响当前报告。
 - 下载接口在采集和恢复期间始终返回上一份完整成果；首次完整交付前明确返回"尚无成果"。
-- `npm test` 用真实本地 HTTP 交互覆盖正常采集、会话恢复、响应中断、布局变化、进程重启，通常在 20–40 秒内结束。
+- `npm test` 用真实本地 HTTP 交互覆盖正常采集、并行耗时、全局限流、会话恢复、响应中断、布局变化、进程重启，通常在 20–40 秒内结束。
 
 ## 快速开始
 
@@ -42,7 +43,14 @@ curl -s -D - -o result.jsonl http://127.0.0.1:4200/api/download
 node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").forEach(l=>console.log(JSON.parse(l).reportNo))'
 ```
 
-环境变量：站点 `SITE_PORT`、`SITE_HOST`、`SITE_LAYOUT=mixed|classic|compact`；采集器 `COLLECTOR_PORT`、`COLLECTOR_HOST`、`COLLECTOR_DATA_DIR`（默认 `data/collector`）、`SITE_URL`（默认 `http://127.0.0.1:4100`）。
+环境变量：站点 `SITE_PORT`、`SITE_HOST`、`SITE_LAYOUT=mixed|classic|compact`；采集器 `COLLECTOR_PORT`、`COLLECTOR_HOST`、`COLLECTOR_DATA_DIR`（默认 `data/collector`）、`COLLECTOR_CONCURRENCY`（默认 `1`）、`SITE_URL`（默认 `http://127.0.0.1:4100`）。
+
+```bash
+# 三路并行采集同一个快照（也可以只设置 COLLECTOR_CONCURRENCY=3）
+curl -s -X POST http://127.0.0.1:4200/api/collect \
+  -H 'content-type: application/json' \
+  -d '{"siteUrl":"http://127.0.0.1:4100","concurrency":3}'
+```
 
 ## 模拟站点设计
 
@@ -68,10 +76,10 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
   - `{"type":"rateLimit","matchPath":"/reports/R-0004","retryAfterMs":40,"times":2}` HTTP 429 + `x-retry-after-ms`。
   - `{"type":"banSession","matchPath":"/reports/R-0002"}` 当前会话立即被封禁（403 `session_banned`）。
   - `{"type":"dropResponse","matchPath":"/appendix"}` 服务端**接受**请求（消耗 nonce 与翻页凭证）后、在写出响应前断开连接。
+  - `{"type":"delay","matchPath":"/reports/R-","excludePath":"/appendix","ms":200}` 延迟响应，便于观察进行中的状态；`excludePath` 可排除附表页，从而只延迟正文。夹具里该延迟是**每个请求固定 200ms**。
   - `{"type":"corruptReport","reportNo":"R-0003","times":1}` 返回 200 但正文不是有效报告（解析失败）。
   - `{"type":"unavailableReport","reportNo":"R-0004","times":1}` 该报告在快照中暂不可用（404）。
-  - `{"type":"delay","matchPath":"/reports/R-0005","ms":250}` 延迟响应，便于观察进行中的状态。
-- `GET /__control/state`、`GET /__control/requests`（含每个请求的状态与会话/快照归属）、`POST /__control/faults/clear`。
+- `GET /__control/state`、`GET /__control/requests`（含每个请求的状态、到达时间 `receivedAt`、完成时间 `at`、会话/快照归属）、`POST /__control/faults/clear`。
 
 ### 动态签名（服务端真实校验）
 
@@ -105,7 +113,7 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 
 | 方法/路径 | 说明 |
 | --- | --- |
-| `POST /api/collect` | body `{"siteUrl":"...","fresh"?:"boolean","snapshotId"?:"string"}`。返回 `202 {accepted, runId, snapshotId, expectedReports}`，后台开始采集。已有未完成运行时默认**续跑**；`fresh:true` 归档旧运行并开始新快照；`snapshotId` 可固定进入某个历史快照。 |
+| `POST /api/collect` | body `{"siteUrl":"...","fresh"?:"boolean","snapshotId"?:"string","concurrency"?:number}`。返回 `202 {accepted, runId, snapshotId, expectedReports}`，后台开始采集。`concurrency` 必须是正整数（默认取 `COLLECTOR_CONCURRENCY`，再默认 `1` = 单路串行）。已有未完成运行时默认**续跑**；`fresh:true` 归档旧运行并开始新快照；`snapshotId` 可固定进入某个历史快照。 |
 | `GET /api/progress` | `{progress, delivery, downloadUrl}`。`progress` 含 `state`（`idle/running/interrupted/failed/complete`）、`snapshotId`、`expectedReports`、`deliveredReports`、`pending`、`missing[]`、`failed[]`（含原因）、`lastError`、`resumedFrom`；`delivery` 是当前可下载的上一份完整成果（没有则为 `{available:false}`）。 |
 | `GET /api/download` | 返回最近一次**完整**交付的 JSONL（`application/x-ndjson`），响应头含 `x-snapshot-id`、`x-delivery-reports`、`x-delivery-sha256`。首次完整交付前返回 `404 {"error":"no_delivery"}`。 |
 | `GET /api/health` | 健康检查。 |
@@ -132,10 +140,17 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 - 只有当本次运行的全部报告都成功时才生成交付并原子替换 `current-delivery.json`；失败运行不触碰上一份交付，进度为 `failed` 并逐条说明缺失/失败原因。
 - 收集期间下载接口读取"指针 → 不可变文件"，始终返回上一份完整成果；如果读取瞬间发生替换，会以新指针重读。
 
+### 并行采集与全局限流
+
+- 每次运行启动 N 个采集 worker（`concurrency`，默认 1 = 单路串行）。每个 worker 拥有**独立会话**，从共享队列领取报告，正文与附表仍按翻页顺序由同一会话抓取。
+- **限流是全局的**：任一会话收到 429，就按 `x-retry-after-ms` 设置本次运行共享的冷却时间；所有会话在发下一个请求前都要等这个时间到点。已经发出的在途请求不会被取消，可以正常完成，其响应照常采用。后来的 429 只会延长、不会缩短冷却时间。
+- **会话失效只重采受影响的报告**：被封禁/失效的会话只属于一个 worker，它把当前报告从正文重新抓取（重新取得翻页 token 后继续同一快照）；其他 worker 不受影响，已落盘的报告也不会再请求。
+- 并发写入互不干扰：状态文件写入串行化，临时文件名唯一，`state.json` 始终是某个完整快照。
+
 ### 失败与恢复策略
 
-- 429：按 `x-retry-after-ms` 等待后重试（nonce 未被消耗）。
-- 401 / 会话被封禁：重新 `GET /reports?snapshot=<固定快照>` 建立新会话，从该报告的**正文**重新开始，以便取得新的翻页凭证。
+- 429：按 `x-retry-after-ms` 设置全局冷却后重试（nonce 未被消耗）。
+- 401 / 会话被封禁：该会话重新 `GET /reports?snapshot=<固定快照>` 建立新会话，只从当前报告的**正文**重新开始，以便取得新的翻页凭证；其他会话继续各自的工作。
 - 连接被断开（response dropped）：nonce 与 token 已消耗，丢弃当前会话并重新进入同一快照，重取该报告。
 - 404（报告不可用）→ 记为 `missing`；HTML 无法解析/结构校验失败 → 记为 `failed`。两者都会让本次运行以 `failed` 结束，不发布交付，但其余成功报告已在磁盘上，下次续跑只需补齐缺失项。
 - 进程被 `SIGKILL`：`state.json` 中留下的 `running` 在下次启动时被识别为 `interrupted`，`POST /api/collect` 默认续跑（`resumedFrom` 记录它从哪次运行恢复）。
@@ -210,6 +225,9 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 | 场景 | 覆盖点 |
 | --- | --- |
 | 正常采集 | 首次下载 404；一次采集完整快照；两种布局；跨页附表（含无附表与 3 页附表）；百分比/mg/kg 精确换算；低于检出限与缺测可区分；交付哈希与报告数。 |
+| 并行耗时 | 默认单路（请求严格前一个完成后才开始，在途峰值 1）；三路在同一份"正文固定延迟 200ms"的本地夹具上总耗时不超过单路的 2/3；两种路数产出 6/6 完整、无重复。 |
+| 全局限流 | 任一会话 429 后，按站点 `receivedAt` 断言所有会话的新请求都在 `x-retry-after-ms` 之后才发出；在途请求正常完成；多会话、最终 6/6。 |
+| 会话失效隔离 | 三路下只封禁一个报告的请求：仅该报告从正文重取一次，其余报告各只取一次，新会话仍绑定原快照。 |
 | 签名/凭证校验 | 无签名 401；nonce 一次性（旧 nonce 重放 401）；翻页 token 重放 409；跨会话使用 token 403；附表入口确实从页面内容发现。 |
 | 会话恢复 | 中途封禁会话 + 限流：自动重建会话、继续同一快照，最终 6/6 完整且无重复；断言新会话仍绑定原快照。 |
 | 响应中断 | 附表响应在送达前断开：token 已消耗 → 重新进入正文取新 token，数据不缺不重。 |
