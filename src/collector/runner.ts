@@ -14,6 +14,7 @@ import {
   CollectorStore,
   type PersistedRun,
   type RunEntry,
+  type ReusedDeliveryRecord,
   toProgress,
   type EntryStatus,
 } from "./storage.js";
@@ -187,6 +188,7 @@ export class Collector {
       entries: directory.entries.map((entry) => ({
         reportNo: entry.reportNo,
         revision: entry.revision,
+        layout: entry.layout,
         status: "pending" as EntryStatus,
       })),
       startedAt: now,
@@ -229,8 +231,10 @@ export class Collector {
       if (!listed) {
         entry.status = "missing";
         entry.reason = "Report is no longer listed in the pinned snapshot";
+        entry.reused = false;
         continue;
       }
+      entry.layout = listed.layout;
       if (listed.revision !== entry.revision) {
         entry.status = "pending";
         entry.revision = listed.revision;
@@ -239,13 +243,48 @@ export class Collector {
     }
     for (const listed of directory.entries) {
       if (!run.entries.some((entry) => entry.reportNo === listed.reportNo)) {
-        run.entries.push({ reportNo: listed.reportNo, revision: listed.revision, status: "pending" });
+        run.entries.push({
+          reportNo: listed.reportNo,
+          revision: listed.revision,
+          layout: listed.layout,
+          status: "pending",
+        });
       }
     }
     run.expectedReports = directory.entries.length;
+
+    // Incremental reuse: a report whose revision AND layout in the pinned
+    // directory both match the last complete delivery from the same site is
+    // carried over without any body/appendix requests. A layout-only change
+    // therefore still triggers re-collection. Reused records keep the
+    // snapshot id, source URLs and collection time of their actual fetch.
+    // The decision is re-derived on every (re)start from the persisted run
+    // and the previous delivery, so an interrupted run resumes by the same
+    // rules.
+    const reuseSource = await this.loadReuseSource(run);
+    const reused = new Map<string, ReusedDeliveryRecord>();
+    for (const entry of run.entries) {
+      const candidate = entry.status === "missing" ? undefined : reuseSource?.get(entry.reportNo);
+      if (
+        candidate &&
+        entry.layout &&
+        candidate.record.revision === entry.revision &&
+        candidate.record.layout === entry.layout
+      ) {
+        entry.reused = true;
+        entry.status = "delivered";
+        entry.sampleCount = candidate.record.samples.length;
+        delete entry.reason;
+        reused.set(entry.reportNo, candidate);
+      } else {
+        entry.reused = false;
+      }
+    }
     await this.store.saveRun(run);
 
     for (const entry of run.entries) {
+      // Reused entries are already satisfied; no page of theirs is requested.
+      if (entry.reused) continue;
       // Any complete record already on disk for this snapshot/revision is
       // trusted and never requested again. This also covers a crash between
       // writing a report and persisting its status.
@@ -299,11 +338,23 @@ export class Collector {
     }
 
     // Complete snapshot: atomically publish a new delivery, leaving the
-    // previous one fully downloadable until the pointer swap.
-    const pointer = await this.store.publishDelivery(
-      run.snapshotId,
-      delivered.map((entry) => entry.reportNo),
-    );
+    // previous one fully downloadable until the pointer swap. The delivery
+    // always contains the full snapshot: freshly fetched reports plus the
+    // reused records carried over from the previous delivery.
+    const pointer = await this.store.publishDelivery({
+      snapshotId: run.snapshotId,
+      siteUrl: run.siteUrl,
+      fetched: delivered.filter((entry) => !entry.reused).map((entry) => entry.reportNo),
+      reused: delivered
+        .filter((entry) => entry.reused)
+        .map((entry) => {
+          const record = reused.get(entry.reportNo);
+          if (!record) {
+            throw new CollectAborted(`Reused record for ${entry.reportNo} is no longer available`);
+          }
+          return record;
+        }),
+    });
     run.state = "complete";
     run.finishedAt = new Date().toISOString();
     run.lastError = null;
@@ -315,6 +366,17 @@ export class Collector {
       );
     }
     return this.resultFromRun(run, true);
+  }
+
+  /**
+   * Load the last complete delivery for reuse decisions. Only a delivery
+   * collected from the very same site qualifies; anything unreadable or
+   * malformed simply disables reuse (the reports are then fetched).
+   */
+  private async loadReuseSource(run: PersistedRun): Promise<Map<string, ReusedDeliveryRecord> | null> {
+    const pointer = await this.store.readDeliveryPointer();
+    if (!pointer || !pointer.siteUrl || pointer.siteUrl !== run.siteUrl) return null;
+    return this.store.readDeliveryRecords(pointer);
   }
 
   /** Fetch body + all appendices, retrying the whole report when its session/token is invalidated. */

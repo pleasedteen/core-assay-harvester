@@ -1,8 +1,11 @@
 /** HTML rendering for the two supported mock-site layouts. */
 
-import type { ContentUnit, MeasurementKind } from "../shared/types.js";
-import type { ReportSeed, SampleSeed, ItemSeed } from "./content.js";
+import type { ContentUnit, Layout, MeasurementKind } from "../shared/types.js";
+import { buildReport, type ReportSeed, type SampleSeed, type ItemSeed } from "./content.js";
 import { REPORT_NOS } from "./content.js";
+
+/** Site-wide layout policy: per-report layouts ("mixed") or one forced layout. */
+export type LayoutMode = "mixed" | Layout;
 
 export const BODY_SAMPLE_CAPACITY = 2;
 export const APPENDIX_SAMPLE_CAPACITY = 1;
@@ -68,23 +71,33 @@ ${content}
 </html>`;
 }
 
-export function renderIndex(
-  snapshotId: string,
-  revisions: Record<string, number>,
-): string {
+/**
+ * The report directory. Each row carries the report's revision and its
+ * effective layout in this snapshot, so a collector can decide from the
+ * directory alone whether a previously delivered report is still current:
+ * a revision bump means new content, a layout change means new pages.
+ */
+export function renderIndex(snapshot: {
+  id: string;
+  revisions: Record<string, number>;
+  layoutMode: LayoutMode;
+}): string {
   const rows = REPORT_NOS.map((reportNo) => {
-    const revision = revisions[reportNo] ?? 1;
+    const revision = snapshot.revisions[reportNo] ?? 1;
+    const layout =
+      snapshot.layoutMode === "mixed" ? buildReport(reportNo, revision).layout : snapshot.layoutMode;
     return `<tr>
-      <td><a href="/reports/${reportNo}" data-role="report" data-report-no="${reportNo}">${reportNo}</a></td>
+      <td><a href="/reports/${reportNo}" data-role="report" data-report-no="${reportNo}" data-layout="${layout}">${reportNo}</a></td>
       <td>${reportNo} 岩芯化验报告</td>
       <td class="revision">${revision}</td>
+      <td class="layout">${layout}</td>
       <td>2026-03-${String(10 + REPORT_NOS.indexOf(reportNo)).padStart(2, "0")}T08:30:00Z</td>
     </tr>`;
   }).join("\n");
   const content = `<h1>报告目录</h1>
-<p class="snapshot" data-snapshot-id="${esc(snapshotId)}">当前快照：${esc(snapshotId)}</p>
+<p class="snapshot" data-snapshot-id="${esc(snapshot.id)}">当前快照：${esc(snapshot.id)}</p>
 <table class="directory">
-  <thead><tr><th>报告编号</th><th>标题</th><th>修订</th><th>发布日期</th></tr></thead>
+  <thead><tr><th>报告编号</th><th>标题</th><th>修订</th><th>版式</th><th>发布日期</th></tr></thead>
   <tbody>
 ${rows}
   </tbody>
@@ -92,7 +105,7 @@ ${rows}
   return shell(
     "报告目录",
     "layout-directory",
-    `<meta charset="utf-8"><meta name="x-snapshot-id" content="${esc(snapshotId)}"><meta name="x-page" content="index">`,
+    `<meta charset="utf-8"><meta name="x-snapshot-id" content="${esc(snapshot.id)}"><meta name="x-page" content="index">`,
     content,
   );
 }

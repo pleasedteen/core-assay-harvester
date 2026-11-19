@@ -22,9 +22,9 @@ import {
   renderErrorPage,
   renderIndex,
   splitPages,
+  type LayoutMode,
 } from "./render.js";
 
-type LayoutMode = "mixed" | Layout;
 type FaultType =
   | "rateLimit"
   | "banSession"
@@ -258,7 +258,7 @@ export class MockAssaySite {
         return;
       }
       const snapshot = auth.snapshot;
-      const html = renderIndex(snapshot.id, snapshot.revisions);
+      const html = renderIndex(snapshot);
       this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 200, sessionId: auth.session.id, snapshotId: snapshot.id, note: "index" });
       this.respondHtml(res, html, auth.session, snapshot);
       return;
@@ -272,7 +272,7 @@ export class MockAssaySite {
       return;
     }
     const session = this.createSession(snapshot.id);
-    const html = renderIndex(snapshot.id, snapshot.revisions);
+    const html = renderIndex(snapshot);
     this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: "index" });
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",

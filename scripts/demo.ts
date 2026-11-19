@@ -83,10 +83,13 @@ try {
     );
   }
 
-  step("resilience: banned session on the next run");
+  step("resilience: reuse + banned session on the next run");
+  // Only R-0001 changed revision, so the next run reuses the other five
+  // reports from the first delivery and fetches just R-0001. Faults are
+  // aimed at R-0001: anything unchanged is never requested.
   await fetch(`${site.url}/__control/fault`, {
     method: "POST",
-    body: JSON.stringify({ type: "banSession", matchPath: "/reports/R-0002" }),
+    body: JSON.stringify({ type: "banSession", matchPath: "/reports/R-0001" }),
   });
   await fetch(`${site.url}/__control/fault`, {
     method: "POST",
@@ -99,9 +102,12 @@ try {
   });
   await collector.wait();
   const recovered = (await (await fetch(`${service.url}/api/progress`)).json()) as {
-    progress: { state: string; deliveredReports: number };
+    progress: { state: string; deliveredReports: number; reused: string[] };
   };
-  console.log(`state=${recovered.progress.state} reports=${recovered.progress.deliveredReports}`);
+  console.log(
+    `state=${recovered.progress.state} reports=${recovered.progress.deliveredReports} ` +
+      `reused=${JSON.stringify(recovered.progress.reused)}`,
+  );
   const recoveredDownload = await fetch(`${service.url}/api/download`);
   console.log(
     `GET /api/download -> ${recoveredDownload.status} snapshot=${recoveredDownload.headers.get("x-snapshot-id")}`,

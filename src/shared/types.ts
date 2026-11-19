@@ -68,6 +68,8 @@ export interface ProgressSnapshot {
   indexUrl: string | null;
   expectedReports: number;
   deliveredReports: number;
+  /** Reports satisfied by reusing the last complete delivery (no requests made). */
+  reused: string[];
   pending: string[];
   missing: Array<{ reportNo: string; reason: string }>;
   failed: Array<{ reportNo: string; reason: string }>;

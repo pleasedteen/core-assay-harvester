@@ -5,8 +5,9 @@
 - 站点与采集器都是真实 HTTP 服务，签名、一次性翻页凭证、限流、封禁会话、响应中断都在服务端真实校验/注入。
 - 站点是纯本地、确定性内容生成器（固定种子），不访问任何外网，也不依赖时间或随机数来决定报告内容。
 - 采集结果以快照为单位物化，进程被杀后可用同一数据目录继续，已完整落盘的报告不会再请求。
+- 增量复用：新快照通常只改几份报告。目录行同时给出修订号与版式，采集器对"同站上次完整交付中修订与版式都没变"的报告直接复用，不再请求正文和附表；只有版式变化同样会重采。交付仍是当前快照的全量成果。
 - 下载接口在采集和恢复期间始终返回上一份完整成果；首次完整交付前明确返回"尚无成果"。
-- `npm test` 用真实本地 HTTP 交互覆盖正常采集、会话恢复、响应中断、布局变化、进程重启，通常在 20–40 秒内结束。
+- `npm test` 用真实本地 HTTP 交互覆盖正常采集、会话恢复、响应中断、布局变化、增量复用、进程重启，通常在 20–40 秒内结束。
 
 ## 快速开始
 
@@ -50,7 +51,7 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 
 | 路径 | 说明 |
 | --- | --- |
-| `GET /reports` | 报告目录。每行有报告编号、修订号、发布日期，链接到正文。这是唯一无需签名的入口，同时下发会话与签名材料。`?snapshot=snap-0001` 可重新进入历史快照。 |
+| `GET /reports` | 报告目录。每行有报告编号、修订号、**版式**、发布日期，链接到正文（链接上还有 `data-layout`）。修订号 + 版式足以判断一份已交付报告能否复用。这是唯一无需签名的入口，同时下发会话与签名材料。`?snapshot=snap-0001` 可重新进入历史快照。 |
 | `GET /reports/:reportNo` | 报告正文（前 2 个样本），含编号、修订、发布日期与化验表。 |
 | `GET /reports/:reportNo/appendix/:page?token=...` | 附表页（每页 1 个样本）。**后续入口只能从页面内容发现**：正文中的附表链接，附表页中的"下一附表"链接。 |
 
@@ -106,7 +107,7 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 | 方法/路径 | 说明 |
 | --- | --- |
 | `POST /api/collect` | body `{"siteUrl":"...","fresh"?:"boolean","snapshotId"?:"string"}`。返回 `202 {accepted, runId, snapshotId, expectedReports}`，后台开始采集。已有未完成运行时默认**续跑**；`fresh:true` 归档旧运行并开始新快照；`snapshotId` 可固定进入某个历史快照。 |
-| `GET /api/progress` | `{progress, delivery, downloadUrl}`。`progress` 含 `state`（`idle/running/interrupted/failed/complete`）、`snapshotId`、`expectedReports`、`deliveredReports`、`pending`、`missing[]`、`failed[]`（含原因）、`lastError`、`resumedFrom`；`delivery` 是当前可下载的上一份完整成果（没有则为 `{available:false}`）。 |
+| `GET /api/progress` | `{progress, delivery, downloadUrl}`。`progress` 含 `state`（`idle/running/interrupted/failed/complete`）、`snapshotId`、`expectedReports`、`deliveredReports`、`reused[]`（本次复用的报告）、`pending`、`missing[]`、`failed[]`（含原因）、`lastError`、`resumedFrom`；`delivery` 是当前可下载的上一份完整成果（没有则为 `{available:false}`）。 |
 | `GET /api/download` | 返回最近一次**完整**交付的 JSONL（`application/x-ndjson`），响应头含 `x-snapshot-id`、`x-delivery-reports`、`x-delivery-sha256`。首次完整交付前返回 `404 {"error":"no_delivery"}`。 |
 | `GET /api/health` | 健康检查。 |
 
@@ -115,6 +116,16 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 - 一次运行开始时从目录读取 `snapshotId`、报告清单与每个报告的修订，随后会话被永久绑定到该快照（服务端所有后续响应都带 `x-snapshot-id`）。站点在此期间发布新修订不影响本次运行：重新进入会话时采集器同样带 `?snapshot=<id>` 回到同一历史快照。
 - 每个报告的所有页面（正文 + 全部附表）必须 `reportNo / revision / snapshotId` 一致，样本总数必须等于页面声明的数量；否则记为解析失败，不算交付。
 - 布局变化（`classic` ↔ `compact`）不影响语义：解析器以页面内容和表头/单元格单位为依据，两种布局产出完全相同的样本/检测项/值。
+
+### 增量复用
+
+新快照通常只改几份报告。一次运行对照目录与**同站**上一份完整交付（交付指针记录站点地址，不同站不复用）逐份判定：
+
+- 目录中该报告的**修订号与版式**都和上一份交付一致 → 复用，不发正文/附表请求（目录请求仍然需要，它是判定依据）。
+- 修订号变了，或**只有版式变了** → 照常重采该报告的正文稿与全部附表。
+- 目录给不出版式（非本模拟站点）→ 该报告一律重采，复用只是优化，永远可以安全回退到全量抓取。
+
+交付仍是**当前快照的全量成果**：复用记录按原样（字节不变）并入新交付文件，保留实际抓取时的 `snapshotId`、`source` 页面 URL（含一次性 token）与 `collectedAt`。因此交付响应头 `x-snapshot-id` 是本次运行快照，而个别记录的 `snapshotId` 可能更早——这正是"它实际来自哪次抓取"的溯源信息。复用判定由持久化的运行状态 + 上一份交付重新推导，进程重启续跑时规则完全相同；若上一份交付不可读，对应报告自动回退为正常抓取。
 
 ### 落盘与恢复
 
@@ -128,7 +139,7 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 ```
 
 - 报告写盘使用临时文件 + `fsync` + `rename`，因此只会出现"完整报告"或"没有"。
-- 续跑时以磁盘上**完整且校验通过**的报告为真：不会重复请求，也覆盖了"写完报告但状态未落盘即被杀"的窗口。
+- 续跑时以磁盘上**完整且校验通过**的报告为真：不会重复请求，也覆盖了"写完报告但状态未落盘即被杀"的窗口。复用的报告不写新快照目录——它们的真源是上一份交付文件，续跑时按同一套复用规则重新判定即可。
 - 只有当本次运行的全部报告都成功时才生成交付并原子替换 `current-delivery.json`；失败运行不触碰上一份交付，进度为 `failed` 并逐条说明缺失/失败原因。
 - 收集期间下载接口读取"指针 → 不可变文件"，始终返回上一份完整成果；如果读取瞬间发生替换，会以新指针重读。
 
@@ -202,6 +213,7 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 - `mgPerKg` 是统一单位后的数值；`mgPerKgExact` 是精确十进制字符串（百分比 ×10000 用整数运算，避免浮点误差）。`rawValue` / `rawUnit` 保留发布时的精确表示。
 - 低于检出限不填 `mgPerKg`，而是给出 `detectionLimitMgPerKg` 与原始检出限；缺测三项皆为 `null`。
 - `source` 记录正文与每个附表页的实际 URL（含一次性 token），每个样本的 `sourceUrl` 标明它发布在正文还是哪一页附表上。
+- 记录里的 `snapshotId` / `collectedAt` 是**实际抓取**时的值：被复用的记录来自更早的运行，其 `snapshotId` 可能早于交付响应头的 `x-snapshot-id`，`source` 也仍是当时实际请求的页面。
 
 ## 自动化测试
 
@@ -216,6 +228,9 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 | 解析失败/暂不可用 | 本次运行 `failed`，逐条列出 `failed`/`missing` 原因，不发布交付也不显示成功；故障解除后同一数据目录续跑成功。 |
 | 快照隔离 | 采集中途发布新修订：本次成果完全来自旧快照；新会话可回到历史快照；`fresh` 运行切到新快照且只含新修订。下载始终返回上一份完整成果；失败运行不会覆盖它。 |
 | 布局变化 | 同一内容在 `classic` 与 `compact` 下解析结果逐项相等。 |
+| 增量复用：局部修订 | 只修订 2 份报告：其余 4 份零请求复用（按站点请求日志逐份断言），交付仍是全量 6 份；复用记录保留原快照/来源/采集时间且逐字节一致。 |
+| 增量复用：仅切换版式 | `reportNos: []` 只切版式：版式变化的报告全部重采、修订号不变；混合版式下只重采版式实际变化的那几份。 |
+| 增量复用：中断续跑 | 复用判定落盘后 `SIGKILL`：重启识别 `interrupted`，续跑按同样规则复用 5 份、只补采修订过的 1 份，交付全量且溯源不变。 |
 | 进程重启 | 真实 `spawn` 采集器进程 → `SIGKILL` → 用同一数据目录重启 → 状态为 `interrupted` → 续跑完成；已落盘报告不再请求（按站点请求日志断言每份只取一次）；重启期间发布的新修订不混入；之后 `fresh` 运行进入新快照。 |
 
 测试进程启动的子进程由 esbuild 一次性打包（`packages: external`，仅打包本仓库源码），避免 tsx 冷启动拖慢计时；打包产物写入 `.tmp/`，不影响其它测试。

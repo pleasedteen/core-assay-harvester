@@ -356,7 +356,10 @@ describe("snapshots and layout", () => {
     const historicalHtml = await historical.text();
     assert.match(historicalHtml, /data-snapshot-id="snap-0001"/);
 
-    // A fresh run picks up the new snapshot and only the new revision.
+    // A fresh run picks up the new snapshot. Only R-0006 changed revision, so
+    // it is the sole report re-fetched; the others are reused from the first
+    // complete delivery and keep the snapshot provenance of their actual
+    // fetch (snap-0001).
     const fresh = await startCollect(h.service.url, h.site.url, { fresh: true });
     assert.equal(fresh.status, 202);
     const freshProgress = await waitForState(h.service.url, ["complete", "failed"]);
@@ -365,9 +368,13 @@ describe("snapshots and layout", () => {
     const second = await download(h.service.url);
     assert.equal(second.records.length, 6);
     for (const record of second.records) {
-      assert.equal(record.snapshotId, newSnapshot.id);
-      if (record.reportNo === "R-0006") assert.equal(record.revision, 2);
-      else assert.equal(record.revision, 1);
+      if (record.reportNo === "R-0006") {
+        assert.equal(record.snapshotId, newSnapshot.id);
+        assert.equal(record.revision, 2);
+      } else {
+        assert.equal(record.snapshotId, "snap-0001", `${record.reportNo} must keep its fetch snapshot`);
+        assert.equal(record.revision, 1);
+      }
     }
   });
 
@@ -414,8 +421,10 @@ describe("snapshots and layout", () => {
     assert.notEqual(second.raw, firstDelivery.raw);
 
     // A later run that fails never replaces or claims success for the last
-    // complete delivery.
-    const thirdSnapshot = await publish(h.site.url, { reportNos: ["R-0002"] });
+    // complete delivery. R-0003 is republished so it is actually re-fetched
+    // (unchanged reports are reused from the last delivery and would never
+    // hit the injected corruption).
+    const thirdSnapshot = await publish(h.site.url, { reportNos: ["R-0002", "R-0003"] });
     await armFault(h.site.url, { type: "corruptReport", reportNo: "R-0003", times: 2 });
     await startCollect(h.service.url, h.site.url, { fresh: true });
     const failedRun = await waitForState(h.service.url, ["complete", "failed"]);
@@ -440,14 +449,22 @@ describe("snapshots and layout", () => {
     const classic = await download(h.service.url);
     assert.ok(classic.records.every((record) => record.layout === "classic"));
 
-    // Same revisions, only the published layout changes.
-    await publish(h.site.url, { layout: "compact", reportNos: [] });
+    // Same revisions, only the published layout changes. A layout-only switch
+    // must re-collect every report: nothing is reusable.
+    const compactSnapshot = await publish(h.site.url, { layout: "compact", reportNos: [] });
     await startCollect(h.service.url, h.site.url, { fresh: true });
     const compactProgress = await waitForState(h.service.url, ["complete", "failed"]);
     assert.equal(compactProgress.state, "complete", compactProgress.lastError ?? "");
+    assert.deepEqual(compactProgress.reused, [], "layout-only switch leaves nothing to reuse");
     const compact = await download(h.service.url);
     assert.equal(compact.records.length, classic.records.length);
     assert.ok(compact.records.every((record) => record.layout === "compact"));
+    // Every record was fetched again inside the new snapshot.
+    assert.ok(compact.records.every((record) => record.snapshotId === compactSnapshot.id));
+    const compactBodies = (await siteRequests(h.site.url)).filter(
+      (request) => request.snapshotId === compactSnapshot.id && request.note === "report_body",
+    );
+    assert.equal(compactBodies.length, 6, "every report body was re-requested after the layout switch");
 
     for (const compactRecord of compact.records) {
       const classicRecord = classic.records.find((record) => record.reportNo === compactRecord.reportNo)!;
@@ -457,6 +474,209 @@ describe("snapshots and layout", () => {
         assert.ok(entry.measurement.rawUnit === entry.measurement.rawUnit);
       }
     }
+  });
+});
+
+describe("incremental reuse", () => {
+  /** Map a delivery body to its exact JSONL lines, keyed by report number. */
+  function linesByReport(raw: string): Map<string, string> {
+    const map = new Map<string, string>();
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      const record = JSON.parse(line) as ReportRecord;
+      map.set(record.reportNo, line);
+    }
+    return map;
+  }
+
+  test("partial revision: unchanged reports are reused, revised ones re-fetched", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    await startCollect(h.service.url, h.site.url);
+    const first = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(first.state, "complete", first.lastError ?? "");
+    const firstDelivery = await download(h.service.url);
+    const firstLines = linesByReport(firstDelivery.raw);
+
+    // Only two reports get a new revision in the next snapshot.
+    const second = await publish(h.site.url, { reportNos: ["R-0002", "R-0005"] });
+    const requestsBefore = (await siteRequests(h.site.url)).length;
+    await startCollect(h.service.url, h.site.url, { fresh: true });
+    const progress = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(progress.state, "complete", progress.lastError ?? "");
+    assert.equal(progress.snapshotId, second.id);
+    assert.equal(progress.deliveredReports, 6);
+    assert.deepEqual(
+      [...progress.reused].sort(),
+      ["R-0001", "R-0003", "R-0004", "R-0006"],
+      "reports with unchanged revision+layout must be reused",
+    );
+
+    // The reused reports were not requested at all: no body, no appendix.
+    const runRequests = (await siteRequests(h.site.url)).slice(requestsBefore);
+    const bodies = bodyRequestCounts(runRequests);
+    assert.deepEqual(
+      [...bodies.keys()].sort(),
+      ["R-0002", "R-0005"],
+      "only revised reports may be fetched",
+    );
+    for (const count of bodies.values()) assert.equal(count, 1);
+    const appendixTargets = runRequests
+      .filter((request) => request.note.startsWith("appendix"))
+      .map((request) => request.url);
+    assert.ok(appendixTargets.length > 0, "revised reports still page through appendices");
+    assert.ok(
+      appendixTargets.every((url) => url.includes("R-0002") || url.includes("R-0005")),
+      `appendix requests must only belong to revised reports: ${appendixTargets.join(", ")}`,
+    );
+
+    // The delivery is still the full snapshot. Reused records keep the
+    // snapshot id, source URLs and collection time of their actual fetch,
+    // and appear byte-for-byte as in the previous delivery.
+    const secondDelivery = await download(h.service.url);
+    assert.equal(secondDelivery.headers.get("x-snapshot-id"), second.id);
+    assert.equal(secondDelivery.records.length, 6);
+    assertNoDuplicateReports(secondDelivery.records);
+    const secondLines = linesByReport(secondDelivery.raw);
+    for (const record of secondDelivery.records) {
+      const original = firstDelivery.records.find((candidate) => candidate.reportNo === record.reportNo)!;
+      if (record.reportNo === "R-0002" || record.reportNo === "R-0005") {
+        assert.equal(record.revision, 2);
+        assert.equal(record.snapshotId, second.id);
+        assert.notEqual(record.collectedAt, original.collectedAt);
+      } else {
+        assert.equal(record.revision, 1);
+        assert.equal(record.snapshotId, first.snapshotId, `${record.reportNo} must keep its fetch snapshot`);
+        assert.equal(record.collectedAt, original.collectedAt, `${record.reportNo} must keep its fetch time`);
+        assert.deepEqual(record.source, original.source, `${record.reportNo} must keep its page sources`);
+        assert.equal(secondLines.get(record.reportNo), firstLines.get(record.reportNo), `${record.reportNo} line must be byte-identical`);
+      }
+    }
+  });
+
+  test("layout-only switch: only reports whose layout changed are re-collected", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    await startCollect(h.service.url, h.site.url);
+    const first = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(first.state, "complete", first.lastError ?? "");
+    const firstDelivery = await download(h.service.url);
+    // mixed seed: R-0001/3/5 are classic, R-0002/4/6 are compact.
+    assert.deepEqual(
+      firstDelivery.records.map((record) => record.layout),
+      ["classic", "compact", "classic", "compact", "classic", "compact"],
+    );
+
+    // New snapshot, same revisions, every report forced to classic.
+    const second = await publish(h.site.url, { reportNos: [], layout: "classic" });
+    const requestsBefore = (await siteRequests(h.site.url)).length;
+    await startCollect(h.service.url, h.site.url, { fresh: true });
+    const progress = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(progress.state, "complete", progress.lastError ?? "");
+    assert.deepEqual(
+      [...progress.reused].sort(),
+      ["R-0001", "R-0003", "R-0005"],
+      "reports already in the target layout are reused",
+    );
+
+    const runRequests = (await siteRequests(h.site.url)).slice(requestsBefore);
+    const bodies = bodyRequestCounts(runRequests);
+    assert.deepEqual(
+      [...bodies.keys()].sort(),
+      ["R-0002", "R-0004", "R-0006"],
+      "only reports whose layout changed are re-collected",
+    );
+
+    const secondDelivery = await download(h.service.url);
+    assert.equal(secondDelivery.records.length, 6);
+    for (const record of secondDelivery.records) {
+      assert.equal(record.revision, 1, "revisions are untouched by a layout-only switch");
+      assert.equal(record.layout, "classic");
+      const original = firstDelivery.records.find((candidate) => candidate.reportNo === record.reportNo)!;
+      // Layout is presentation-only: parsed content is identical either way.
+      assert.deepEqual(sampleSnapshot(record.samples), sampleSnapshot(original.samples));
+      if (["R-0002", "R-0004", "R-0006"].includes(record.reportNo)) {
+        assert.equal(record.snapshotId, second.id);
+      } else {
+        assert.equal(record.snapshotId, first.snapshotId);
+      }
+    }
+  });
+
+  test("interrupted run resumes with the same reuse rules", async () => {
+    const site = await MockAssaySite.start({ seedSnapshot: { layoutMode: "mixed" } });
+    cleanup.push(() => site.close());
+    const dataDir = await tempDataDir("reuse-restart");
+    const port = await freePort();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const childEntry = await buildCollectorEntry();
+
+    // First complete delivery on snap-0001.
+    let launched = spawnCollector(childEntry, dataDir, port, site.url);
+    await launched.ready;
+    let child = launched.child;
+    await startCollect(baseUrl, site.url);
+    const first = await waitForState(baseUrl, ["complete", "failed"]);
+    assert.equal(first.state, "complete", first.lastError ?? "");
+    const firstDelivery = await download(baseUrl);
+
+    // A new snapshot revises one report; the other five are reusable. Hold
+    // the revised report open so the run is provably mid-flight when killed.
+    const second = await publish(site.url, { reportNos: ["R-0006"] });
+    await armFault(site.url, { type: "delay", matchPath: "/reports/R-0006", ms: 2_500, times: 1 });
+    await startCollect(baseUrl, site.url, { fresh: true });
+    await waitUntil(async () => {
+      const current = (await getProgress(baseUrl)).progress;
+      return current.reused.length === 5 && current.deliveredReports === 5;
+    });
+    child.kill("SIGKILL");
+    await waitForExit(child);
+
+    // Restart on the same data dir: the run is resumed, not restarted.
+    launched = spawnCollector(childEntry, dataDir, port, site.url);
+    await launched.ready;
+    child = launched.child;
+    const interrupted = await getProgress(baseUrl);
+    assert.equal(interrupted.progress.state, "interrupted");
+    assert.equal(interrupted.progress.snapshotId, second.id);
+
+    const requestsBeforeResume = (await siteRequests(site.url)).length;
+    await startCollect(baseUrl, site.url);
+    const resumed = await waitForState(baseUrl, ["complete", "failed"], 25_000);
+    assert.equal(resumed.state, "complete", resumed.lastError ?? "");
+    assert.equal(resumed.deliveredReports, 6);
+    assert.deepEqual(
+      [...resumed.reused].sort(),
+      ["R-0001", "R-0002", "R-0003", "R-0004", "R-0005"],
+      "the resumed run must apply the same reuse rules",
+    );
+
+    // After the restart only the revised report was fetched; the reusable
+    // ones never hit the site again.
+    const resumeRequests = (await siteRequests(site.url)).slice(requestsBeforeResume);
+    const bodies = bodyRequestCounts(resumeRequests);
+    assert.deepEqual([...bodies.keys()], ["R-0006"]);
+    assert.ok(
+      !resumeRequests.some((request) => request.note.startsWith("appendix") && !request.url.includes("R-0006")),
+      "no appendix of a reused report may be requested after resume",
+    );
+
+    const delivery = await download(baseUrl);
+    assert.equal(delivery.headers.get("x-snapshot-id"), second.id);
+    assert.equal(delivery.records.length, 6);
+    const firstLines = linesByReport(firstDelivery.raw);
+    const lines = linesByReport(delivery.raw);
+    for (const record of delivery.records) {
+      if (record.reportNo === "R-0006") {
+        assert.equal(record.revision, 2);
+        assert.equal(record.snapshotId, second.id);
+      } else {
+        assert.equal(record.revision, 1);
+        assert.equal(record.snapshotId, first.snapshotId);
+        assert.equal(lines.get(record.reportNo), firstLines.get(record.reportNo));
+      }
+    }
+
+    child.kill("SIGTERM");
+    await waitForExit(child);
   });
 });
 

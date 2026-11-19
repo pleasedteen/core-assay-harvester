@@ -9,11 +9,18 @@ import {
   SNAPSHOT_HEADER,
   computeSignature,
 } from "../shared/protocol.js";
+import type { Layout } from "../shared/types.js";
 import { ParseError } from "./parse.js";
 
 export interface DirectoryEntry {
   reportNo: string;
   revision: number;
+  /**
+   * Layout the site declares for this report in the pinned snapshot, or null
+   * when the directory does not say. Together with the revision this decides
+   * whether a previously delivered record may be reused; null disables reuse.
+   */
+  layout: Layout | null;
   url: string;
 }
 
@@ -80,8 +87,14 @@ export function parseDirectoryPage(html: string, baseUrl: string): DirectoryPage
       if (!Number.isInteger(revision) || revision < 1) {
         throw new ParseError(`Directory entry ${reportNo} has no valid revision`);
       }
+      const layoutText = (
+        $(anchor).attr("data-layout") ??
+        row.find(".layout").first().text()
+      ).trim();
+      const layout: Layout | null =
+        layoutText === "classic" || layoutText === "compact" ? layoutText : null;
       seen.add(reportNo);
-      entries.push({ reportNo, revision, url: new URL(href, baseUrl).toString() });
+      entries.push({ reportNo, revision, layout, url: new URL(href, baseUrl).toString() });
     },
   );
   if (entries.length === 0) throw new ParseError("Directory page contains no report entries");
