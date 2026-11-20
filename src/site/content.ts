@@ -121,6 +121,21 @@ function buildItems(
     items[3] = { code: "Pb", name: "铅", kind: "missing", value: null, unit: null, limit: null };
   }
 
+  // Detection-item sets are allowed to differ between samples of one report:
+  // roughly half the samples additionally carry a Zn (锌) result. The
+  // directory manifest declares exactly which samples include it.
+  const zincRoll = rng();
+  if ((reportIndex + sampleIndex) % 2 === 0) {
+    items.push({
+      code: "Zn",
+      name: "锌",
+      kind: "value",
+      value: (15 + zincRoll * 220).toFixed(1),
+      unit: "mg/kg",
+      limit: null,
+    });
+  }
+
   return items;
 }
 
@@ -151,5 +166,20 @@ export function buildReport(reportNo: string, revision: number): ReportSeed {
     layout: revision === 1 ? layout : layout === "classic" ? "compact" : "classic",
     publishedAt: `2026-${revision === 1 ? "03" : "05"}-${String(10 + reportIndex).padStart(2, "0")}T08:30:00Z`,
     samples,
+  };
+}
+
+/**
+ * The authoritative declaration published in the directory manifest: which
+ * samples exist and which detection items each of them must carry.
+ */
+export function reportDeclaration(report: ReportSeed): import("../shared/types.js").ReportDeclaration {
+  return {
+    reportNo: report.reportNo,
+    revision: report.revision,
+    samples: report.samples.map((sample) => ({
+      sampleId: sample.sampleId,
+      items: sample.items.map((item) => ({ code: item.code, name: item.name })),
+    })),
   };
 }

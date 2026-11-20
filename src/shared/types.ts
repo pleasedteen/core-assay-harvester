@@ -42,6 +42,37 @@ export interface Sample {
   items: AssayItem[];
 }
 
+/** What the site declares one sample must contain. */
+export interface SampleDeclaration {
+  sampleId: string;
+  /** Detection items expected for this sample; samples in one report may differ. */
+  items: Array<{ code: string; name: string }>;
+}
+
+/** Directory-level declaration of a report's samples and their detection items. */
+export interface ReportDeclaration {
+  reportNo: string;
+  revision: number;
+  samples: SampleDeclaration[];
+}
+
+export type DeclarationDiscrepancyType =
+  | "sample_missing"
+  | "sample_unexpected"
+  | "item_missing"
+  | "item_duplicated"
+  | "extra_item"
+  | "limit_without_value";
+
+/** A single declaration-vs-content mismatch, always naming the sample and item when applicable. */
+export interface DeclarationDiscrepancy {
+  type: DeclarationDiscrepancyType;
+  reportNo: string;
+  sampleId: string | null;
+  itemCode: string | null;
+  detail: string;
+}
+
 export interface ReportRecord {
   reportNo: string;
   revision: number;
@@ -70,7 +101,7 @@ export interface ProgressSnapshot {
   deliveredReports: number;
   pending: string[];
   missing: Array<{ reportNo: string; reason: string }>;
-  failed: Array<{ reportNo: string; reason: string }>;
+  failed: Array<{ reportNo: string; reason: string; discrepancies?: DeclarationDiscrepancy[] }>;
   startedAt: string | null;
   updatedAt: string | null;
   finishedAt: string | null;

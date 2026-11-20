@@ -4,7 +4,12 @@ import * as cheerio from "cheerio/slim";
 import type { Cheerio, CheerioAPI } from "cheerio/slim";
 import type { AnyNode } from "domhandler";
 import type { ContentUnit, Layout, Measurement, ReportRecord, Sample } from "../shared/types.js";
-import { belowDetectionLimit, measurementFromValue, missingMeasurement } from "../shared/units.js";
+import {
+  belowDetectionLimit,
+  belowDetectionLimitWithoutValue,
+  measurementFromValue,
+  missingMeasurement,
+} from "../shared/units.js";
 
 export class ParseError extends Error {
   constructor(message: string) {
@@ -113,8 +118,11 @@ function parseMeasurement(rawText: string, contextUnit: ContentUnit | null): Mea
   if (isBelowDetectionLimit(valuePart)) {
     const limitMatch = /(-?\d+(?:\.\d+)?)/.exec(valuePart);
     if (!limitMatch) {
+      // "< mg/kg" style cell: a below-detection-limit result whose detection
+      // limit has no numeric value. Kept parseable so declaration
+      // verification can name the sample and item precisely.
       if (!unit) throw new ParseError(`Below-detection-limit cell "${text}" has no unit`);
-      return belowDetectionLimit("0", unit, valuePart);
+      return belowDetectionLimitWithoutValue(unit, valuePart);
     }
     if (!unit) {
       throw new ParseError(`Below-detection-limit cell "${text}" has no detectable unit`);
@@ -177,7 +185,15 @@ function parseClassicTable($: CheerioAPI, table: Cheerio<AnyNode>): Sample[] {
     const lithology = lithColumn >= 0 ? normalizeSpace($(cells[lithColumn]!).text()) || null : null;
 
     const items = itemHeaders.map((item) => {
-      const cell = $(cells[item.index]!);
+      // Prefer the cell explicitly carrying the item code; fall back to the
+      // header column position. Untested cells (the manifest's item set does
+      // not include this item for this sample) are simply absent.
+      const explicit = $(row).find(`td[data-item="${item.code}"]`).first();
+      const positioned = $(cells[item.index]!);
+      const cell = explicit.length > 0 ? explicit : positioned;
+      if (cell.attr("data-untested") === "true" || cell.hasClass("untested")) {
+        return null;
+      }
       const cellUnit = normalizeUnit(cell.attr("data-unit"));
       const unit = cellUnit && item.unit && cellUnit !== item.unit
         ? (() => { throw new ParseError(`Unit conflict for ${item.code}: header ${item.unit}, cell ${cellUnit}`); })()
@@ -187,7 +203,7 @@ function parseClassicTable($: CheerioAPI, table: Cheerio<AnyNode>): Sample[] {
         name: item.name,
         measurement: parseMeasurement(cell.text(), unit),
       };
-    });
+    }).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
     if (items.length === 0) throw new ParseError(`Sample ${sampleId} has no result columns`);
     samples.push({ sampleId, ...depth, lithology, sourceUrl: "", items });
   });
@@ -346,7 +362,9 @@ export function parsePage(html: string, context: ParseContext = {}): ParsedPage 
         : "classic");
 
   const parsedSamples = layout === "compact" ? parseCompactTable($, table) : parseClassicTable($, table);
-  if (parsedSamples.length === 0) throw new ParseError(`Page for ${reportNo} contains no samples`);
+  // A page may legitimately carry zero samples when its only sample was
+  // omitted from the published content; the declaration verifier reports the
+  // missing sample by id rather than failing the whole parse.
   const sourceUrl = context.sourceUrl ?? "";
   const samples = parsedSamples.map((sample) => ({ ...sample, sourceUrl }));
 
@@ -448,11 +466,9 @@ export function mergeReportParts(
   }
 
   const samples = order.map((id) => byId.get(id)!);
-  if (first.declaredSampleCount !== null && samples.length !== first.declaredSampleCount) {
-    throw new ParseError(
-      `Expected ${first.declaredSampleCount} samples for ${first.reportNo}, parsed ${samples.length}`,
-    );
-  }
+  // Note: a sample count mismatch (missing row/page) is deliberately not a
+  // hard parse error here; declaration verification reports the missing
+  // sample by id so progress can name it precisely.
 
   return {
     layout: first.layout,

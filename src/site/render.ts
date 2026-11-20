@@ -1,6 +1,6 @@
 /** HTML rendering for the two supported mock-site layouts. */
 
-import type { ContentUnit, MeasurementKind } from "../shared/types.js";
+import type { ContentUnit, MeasurementKind, ReportDeclaration } from "../shared/types.js";
 import type { ReportSeed, SampleSeed, ItemSeed } from "./content.js";
 import { REPORT_NOS } from "./content.js";
 
@@ -71,6 +71,7 @@ ${content}
 export function renderIndex(
   snapshotId: string,
   revisions: Record<string, number>,
+  declarations: ReportDeclaration[],
 ): string {
   const rows = REPORT_NOS.map((reportNo) => {
     const revision = revisions[reportNo] ?? 1;
@@ -81,8 +82,12 @@ export function renderIndex(
       <td>2026-03-${String(10 + REPORT_NOS.indexOf(reportNo)).padStart(2, "0")}T08:30:00Z</td>
     </tr>`;
   }).join("\n");
+  // The manifest is the site's authoritative declaration of the samples and
+  // per-sample detection items every report in this snapshot must contain.
+  const manifest = JSON.stringify({ snapshotId, reports: declarations });
   const content = `<h1>报告目录</h1>
 <p class="snapshot" data-snapshot-id="${esc(snapshotId)}">当前快照：${esc(snapshotId)}</p>
+<script id="assay-manifest" type="application/json">${manifest.replaceAll("<", "\\u003c")}</script>
 <table class="directory">
   <thead><tr><th>报告编号</th><th>标题</th><th>修订</th><th>发布日期</th></tr></thead>
   <tbody>
@@ -101,28 +106,58 @@ function unitLabel(unit: ContentUnit): string {
   return unit === "pct" ? "%" : "mg/kg";
 }
 
-function classicResultCell(item: ItemSeed): string {
+function classicResultCell(item: ItemSeed | undefined): string {
+  if (!item) {
+    // The report-level manifest includes this column, but this particular
+    // sample does not carry the item: an explicit "untested" cell.
+    return `<td class="result untested" data-untested="true">未测</td>`;
+  }
   const kind: MeasurementKind = item.kind;
   if (kind === "value") {
     return `<td class="result value" data-item="${esc(item.code)}" data-unit="${esc(item.unit!)}">${esc(item.value!)}</td>`;
   }
   if (kind === "below_detection_limit") {
-    return `<td class="result bdl" data-item="${esc(item.code)}" data-unit="${esc(item.unit!)}">&lt; ${esc(item.limit!)}</td>`;
+    const text = item.limit ? `&lt; ${esc(item.limit)}` : "&lt;";
+    return `<td class="result bdl" data-item="${esc(item.code)}" data-unit="${esc(item.unit!)}">${text}</td>`;
   }
   return `<td class="result missing" data-item="${esc(item.code)}">—</td>`;
 }
 
-function classicTable(report: ReportSeed, samples: SampleSeed[], part: number): string {
-  const headers = report.samples[0]!.items
-    .map((item) => `<th>${esc(item.code)} / ${esc(item.name)} (${unitLabel(item.unit ?? "mg/kg")})</th>`)
+/** Ordered union of item codes across the samples rendered on one page. */
+function unionItemColumns(samples: SampleSeed[]): ItemSeed[] {
+  const columns: ItemSeed[] = [];
+  const seen = new Set<string>();
+  for (const sample of samples) {
+    for (const item of sample.items) {
+      if (seen.has(item.code)) continue;
+      seen.add(item.code);
+      columns.push(item);
+    }
+  }
+  return columns;
+}
+
+function classicTable(samples: SampleSeed[], part: number): string {
+  const columns = unionItemColumns(samples);
+  const headers = columns
+    .map((item) => {
+      const unit: ContentUnit = item.unit ?? "mg/kg";
+      return `<th data-item="${esc(item.code)}">${esc(item.code)} / ${esc(item.name)} (${unitLabel(unit)})</th>`;
+    })
     .join("");
   const rows = samples
-    .map((sample) => `<tr data-sample-id="${esc(sample.sampleId)}">
+    .map((sample) => {
+      const byCode = new Map(sample.items.map((item) => [item.code, item]));
+      const cells = columns
+        .map((column) => classicResultCell(byCode.get(column.code)))
+        .join("\n      ");
+      return `<tr data-sample-id="${esc(sample.sampleId)}">
       <td class="sid">${esc(sample.sampleId)}</td>
       <td class="depth">${esc(sample.fromM)}–${esc(sample.toM)} m</td>
       <td class="lith">${esc(sample.lithology)}</td>
-      ${sample.items.map(classicResultCell).join("\n      ")}
-    </tr>`)
+      ${cells}
+    </tr>`;
+    })
     .join("\n");
   return `<table class="assay classic" data-part="${part}">
   <thead><tr><th>样本号</th><th>深度 (m)</th><th>岩性</th>${headers}</tr></thead>
@@ -137,7 +172,9 @@ function compactResultCell(item: ItemSeed): string {
     item.kind === "value"
       ? `${item.value!} ${unitLabel(item.unit!)}`
       : item.kind === "below_detection_limit"
-        ? `< ${item.limit!} ${unitLabel(item.unit!)}`
+        ? item.limit
+          ? `< ${item.limit!} ${unitLabel(item.unit!)}`
+          : `< ${unitLabel(item.unit!)}`
         : "—";
   const cls = item.kind === "below_detection_limit" ? "bdl" : item.kind === "missing" ? "missing" : "value";
   const unitAttr = item.kind === "missing" ? "" : ` data-unit="${esc(item.unit!)}"`;
@@ -189,7 +226,7 @@ export function renderBodyPage(
   samples: SampleSeed[],
   appendixHref: string | null,
 ): string {
-  const table = report.layout === "classic" ? classicTable(report, samples, 1) : compactTable(samples, 1);
+  const table = report.layout === "classic" ? classicTable(samples, 1) : compactTable(samples, 1);
   let links = "";
   if (appendixHref) {
     links =
@@ -212,7 +249,7 @@ export function renderAppendixPage(
   nextHref: string | null,
 ): string {
   const part = page;
-  const table = report.layout === "classic" ? classicTable(report, samples, part) : compactTable(samples, part);
+  const table = report.layout === "classic" ? classicTable(samples, part) : compactTable(samples, part);
   let pager = "";
   if (nextHref) {
     pager =

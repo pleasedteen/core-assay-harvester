@@ -14,7 +14,12 @@ import {
   computeSignature,
 } from "../shared/protocol.js";
 import type { Layout } from "../shared/types.js";
-import { REPORT_NOS, buildReport, type ReportSeed } from "./content.js";
+import { REPORT_NOS, buildReport, reportDeclaration, type ReportSeed, type SampleSeed } from "./content.js";
+import {
+  applyContentDefects,
+  type ContentDefect,
+  type ContentDefectType,
+} from "./defects.js";
 import {
   appendixPageCount,
   renderAppendixPage,
@@ -117,6 +122,8 @@ export class MockAssaySite {
   private signedCounter = 0;
   private readonly corruptedReports = new Map<string, number>();
   private readonly unavailableReports = new Map<string, number>();
+  /** Semantic content defects keyed by report; the manifest never reflects them. */
+  private readonly contentDefects = new Map<string, ContentDefect[]>();
 
   private constructor(seed?: SiteOptions["seedSnapshot"]) {
     const layoutMode = seed?.layoutMode ?? "mixed";
@@ -179,6 +186,33 @@ export class MockAssaySite {
 
   private currentSnapshot(): Snapshot {
     return this.snapshotById(this.currentSnapshotId)!;
+  }
+
+  /** Build the report for the current revision; the manifest always matches it. */
+  private buildRenderedReport(reportNo: string, revision: number): ReportSeed {
+    return buildReport(reportNo, revision);
+  }
+
+  /**
+   * Apply armed semantic content defects to one page's samples. Defects whose
+   * target is not on this page keep their budget; defects that fire spend one
+   * render and are dropped once exhausted.
+   */
+  private defectPageSamples(reportNo: string, report: ReportSeed, samples: SampleSeed[]): SampleSeed[] {
+    const defects = this.contentDefects.get(reportNo);
+    if (!defects || defects.length === 0) return samples;
+    const rendered = applyContentDefects(report, samples, defects);
+    const active = defects.filter((defect) => defect.times > 0);
+    if (active.length === 0) this.contentDefects.delete(reportNo);
+    else this.contentDefects.set(reportNo, active);
+    return rendered;
+  }
+
+  /** Intact declarations published in the directory manifest. */
+  private manifestDeclarations(snapshot: Snapshot) {
+    return REPORT_NOS.map((reportNo) =>
+      reportDeclaration(buildReport(reportNo, snapshot.revisions[reportNo] ?? 1)),
+    );
   }
 
   private log(entry: Omit<RequestLogEntry, "at">): void {
@@ -258,7 +292,7 @@ export class MockAssaySite {
         return;
       }
       const snapshot = auth.snapshot;
-      const html = renderIndex(snapshot.id, snapshot.revisions);
+      const html = renderIndex(snapshot.id, snapshot.revisions, this.manifestDeclarations(snapshot));
       this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 200, sessionId: auth.session.id, snapshotId: snapshot.id, note: "index" });
       this.respondHtml(res, html, auth.session, snapshot);
       return;
@@ -272,7 +306,7 @@ export class MockAssaySite {
       return;
     }
     const session = this.createSession(snapshot.id);
-    const html = renderIndex(snapshot.id, snapshot.revisions);
+    const html = renderIndex(snapshot.id, snapshot.revisions, this.manifestDeclarations(snapshot));
     this.log({ method: req.method ?? "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: "index" });
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
@@ -465,9 +499,9 @@ export class MockAssaySite {
       return;
     }
 
-    const report = buildReport(reportNo, revision);
+    const report = this.buildRenderedReport(reportNo, revision);
     const pages = splitPages(report);
-    const bodySamples = pages[0]!;
+    const bodySamples = this.defectPageSamples(reportNo, report, pages[0]!);
     const token = this.issueToken(session, reportNo, 1);
     const appendixHref =
       pages.length > 1 ? `/reports/${encodeURIComponent(reportNo)}/appendix/1?token=${token.token}` : null;
@@ -539,10 +573,10 @@ export class MockAssaySite {
       return;
     }
 
-    const report = buildReport(reportNo, revision);
+    const report = this.buildRenderedReport(reportNo, revision);
     const pages = splitPages(report);
-    const pageSamples = pages[page];
-    if (page < 1 || page > appendixPageCount(report) || !pageSamples) {
+    const intactPageSamples = pages[page];
+    if (page < 1 || page > appendixPageCount(report) || !intactPageSamples) {
       this.sendJson(res, 404, { error: "page_not_found", message: "附表页不存在。" }, {
         [SNAPSHOT_HEADER]: snapshot.id,
         [NONCE_HEADER]: session.nonce,
@@ -550,6 +584,7 @@ export class MockAssaySite {
       this.log({ method: "GET", url: req.url ?? "", status: 404, sessionId: session.id, snapshotId: snapshot.id, note: "page_not_found" });
       return;
     }
+    const pageSamples = this.defectPageSamples(reportNo, report, intactPageSamples);
     const nextToken = page < appendixPageCount(report) ? this.issueToken(session, reportNo, page + 1) : null;
     const nextHref = nextToken
       ? `/reports/${encodeURIComponent(reportNo)}/appendix/${page + 1}?token=${nextToken.token}`
@@ -614,6 +649,7 @@ export class MockAssaySite {
             signedRequests,
           })),
           faults: this.faults,
+          contentDefects: [...this.contentDefects.values()].flat(),
         });
         return;
       }
@@ -649,10 +685,39 @@ export class MockAssaySite {
         return;
       }
       case "/__control/fault": {
-        const body = JSON.parse((await this.readBody(req)) || "{}") as Partial<Fault> & { type?: string };
-        const allowed = ["rateLimit", "banSession", "dropResponse", "delay", "corruptReport", "unavailableReport"];
-        if (!body.type || !allowed.includes(body.type)) {
-          this.sendJson(res, 400, { error: "bad_fault", message: `type must be one of ${allowed.join("|")}` });
+        const body = JSON.parse((await this.readBody(req)) || "{}") as Partial<ContentDefect> &
+          Partial<Fault> & { type?: string };
+        const transportAllowed = ["rateLimit", "banSession", "dropResponse", "delay", "corruptReport", "unavailableReport"];
+        const contentAllowed: ContentDefectType[] = [
+          "omitSample",
+          "omitItem",
+          "duplicateItem",
+          "limitWithoutValue",
+        ];
+        if (!body.type || ![...transportAllowed, ...contentAllowed].includes(body.type)) {
+          this.sendJson(res, 400, {
+            error: "bad_fault",
+            message: `type must be one of ${[...transportAllowed, ...contentAllowed].join("|")}`,
+          });
+          return;
+        }
+        if (contentAllowed.includes(body.type as ContentDefectType)) {
+          if (!body.reportNo) {
+            this.sendJson(res, 400, { error: "bad_fault", message: "reportNo required" });
+            return;
+          }
+          const defect: ContentDefect = {
+            type: body.type as ContentDefectType,
+            reportNo: body.reportNo,
+            times: Math.max(1, body.times ?? 1),
+            sampleId: body.sampleId,
+            itemCode: body.itemCode,
+            sourceItemCode: body.sourceItemCode,
+          };
+          const list = this.contentDefects.get(defect.reportNo) ?? [];
+          list.push(defect);
+          this.contentDefects.set(defect.reportNo, list);
+          this.sendJson(res, 201, { armed: defect });
           return;
         }
         if (body.type === "corruptReport" || body.type === "unavailableReport") {
@@ -667,7 +732,7 @@ export class MockAssaySite {
           return;
         }
         const fault: Fault = {
-          type: body.type,
+          type: body.type as FaultType,
           matchPath: body.matchPath,
           times: Math.max(1, body.times ?? 1),
           remaining: Math.max(1, body.times ?? 1),
@@ -682,6 +747,7 @@ export class MockAssaySite {
         this.faults.length = 0;
         this.corruptedReports.clear();
         this.unavailableReports.clear();
+        this.contentDefects.clear();
         this.sendJson(res, 200, { cleared: true });
         return;
       }

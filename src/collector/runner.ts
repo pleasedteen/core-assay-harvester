@@ -1,7 +1,7 @@
 /** Snapshot-pinned collection orchestrator with durable, resumable progress. */
 
 import { randomUUID } from "node:crypto";
-import type { ReportRecord } from "../shared/types.js";
+import type { ReportDeclaration, ReportRecord } from "../shared/types.js";
 import {
   SignedClient,
   TokenRejectedError,
@@ -17,7 +17,19 @@ import {
   toProgress,
   type EntryStatus,
 } from "./storage.js";
+import { describeDiscrepancies, verifyAgainstDeclaration } from "./verify.js";
 import type { ProgressSnapshot } from "../shared/types.js";
+
+/** Raised when a fetched or cached report disagrees with its declaration. */
+export class VerificationError extends Error {
+  constructor(
+    readonly reportNo: string,
+    readonly discrepancies: ReturnType<typeof verifyAgainstDeclaration>,
+  ) {
+    super(`Declaration verification failed for ${reportNo}: ${describeDiscrepancies(discrepancies)}`);
+    this.name = "VerificationError";
+  }
+}
 
 export interface CollectorOptions {
   dataDir: string;
@@ -44,7 +56,7 @@ export interface RunResult {
   expectedReports: number;
   deliveredReports: number;
   missing: Array<{ reportNo: string; reason: string }>;
-  failed: Array<{ reportNo: string; reason: string }>;
+  failed: Array<{ reportNo: string; reason: string; discrepancies?: ReturnType<typeof verifyAgainstDeclaration> }>;
   deliveryPublished: boolean;
 }
 
@@ -189,6 +201,7 @@ export class Collector {
         revision: entry.revision,
         status: "pending" as EntryStatus,
       })),
+      declarations: directory.declarations,
       startedAt: now,
       updatedAt: now,
       finishedAt: null,
@@ -242,38 +255,57 @@ export class Collector {
         run.entries.push({ reportNo: listed.reportNo, revision: listed.revision, status: "pending" });
       }
     }
+    // The directory manifest is the only authority used to verify the cache.
+    run.declarations = directory.declarations;
     run.expectedReports = directory.entries.length;
+    const declarationByReport = new Map(
+      directory.declarations.map((declaration) => [declaration.reportNo, declaration]),
+    );
     await this.store.saveRun(run);
 
     for (const entry of run.entries) {
+      const declaration = declarationByReport.get(entry.reportNo);
       // Any complete record already on disk for this snapshot/revision is
-      // trusted and never requested again. This also covers a crash between
-      // writing a report and persisting its status.
+      // trusted only if it still satisfies the site's directory declaration.
+      // Verification reads the cached report only — no body or appendix page
+      // is requested for an intact cache entry. A report that cannot be
+      // verified is re-collected below.
       const stored = await this.store.readReport(run.snapshotId, entry.reportNo, entry.revision);
       if (stored) {
-        const wasDelivered = entry.status === "delivered";
-        entry.status = "delivered";
-        entry.sampleCount = stored.samples.length;
-        delete entry.reason;
-        if (!wasDelivered) await this.store.saveRun(run);
-        continue;
-      }
-      if (entry.status === "delivered") {
+        const cacheIssues = declaration ? verifyAgainstDeclaration(stored, declaration) : [];
+        if (cacheIssues.length === 0) {
+          const wasDelivered = entry.status === "delivered";
+          entry.status = "delivered";
+          entry.sampleCount = stored.samples.length;
+          delete entry.reason;
+          delete entry.discrepancies;
+          if (!wasDelivered) await this.store.saveRun(run);
+          continue;
+        }
+        // The cached copy is stale relative to the declaration: drop its
+        // "delivered" claim and re-collect the report.
+        entry.status = "pending";
+        entry.reason = `Cached report fails declaration verification, re-collecting: ${describeDiscrepancies(cacheIssues)}`;
+        await this.store.saveRun(run);
+      } else if (entry.status === "delivered") {
         entry.status = "pending";
         await this.store.saveRun(run);
       }
 
       try {
-        const record = await this.collectReport(client, run, entry);
+        const record = await this.collectReport(client, run, entry, declaration);
         await this.store.writeReport(run.snapshotId, record);
         entry.status = "delivered";
         entry.sampleCount = record.samples.length;
         delete entry.reason;
+        delete entry.discrepancies;
       } catch (error) {
         if (error instanceof CollectAborted) throw error;
-        const { status, reason } = classifyFailure(error);
+        const { status, reason, discrepancies } = classifyFailure(error);
         entry.status = status;
         entry.reason = reason;
+        if (discrepancies) entry.discrepancies = discrepancies;
+        else delete entry.discrepancies;
         this.lastError = `${entry.reportNo}: ${reason}`;
         run.lastError = this.lastError;
       }
@@ -322,11 +354,12 @@ export class Collector {
     client: SignedClient,
     run: PersistedRun,
     entry: RunEntry,
+    declaration: ReportDeclaration | undefined,
   ): Promise<ReportRecord> {
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= this.reportAttempts; attempt++) {
       try {
-        return await this.fetchAndMerge(client, run, entry);
+        return await this.fetchAndMerge(client, run, entry, declaration);
       } catch (error) {
         lastError = error;
         const retryable =
@@ -349,6 +382,7 @@ export class Collector {
     client: SignedClient,
     run: PersistedRun,
     entry: RunEntry,
+    declaration: ReportDeclaration | undefined,
   ): Promise<ReportRecord> {
     const bodyUrl = new URL(`/reports/${encodeURIComponent(entry.reportNo)}`, run.siteUrl);
     const parts: PagePart[] = [];
@@ -385,6 +419,16 @@ export class Collector {
       expectedSnapshotId: run.snapshotId,
       expectedRevision: entry.revision,
     });
+    // Reconcile the parsed body and every appendix page with the directory
+    // manifest: sample rows, per-sample detection items, duplicates and
+    // quantifiable detection limits. A report with zero samples is itself a
+    // declaration discrepancy, not a parse error.
+    if (declaration) {
+      const discrepancies = verifyAgainstDeclaration(merged.record, declaration);
+      if (discrepancies.length > 0) {
+        throw new VerificationError(entry.reportNo, discrepancies);
+      }
+    }
     if (merged.record.samples.length === 0) {
       throw new ParseError(`Report ${entry.reportNo} has no samples`);
     }
@@ -413,13 +457,28 @@ export class Collector {
         .map((entry) => ({ reportNo: entry.reportNo, reason: entry.reason ?? "unavailable" })),
       failed: run.entries
         .filter((entry) => entry.status === "failed")
-        .map((entry) => ({ reportNo: entry.reportNo, reason: entry.reason ?? "unknown" })),
+        .map((entry) => ({
+          reportNo: entry.reportNo,
+          reason: entry.reason ?? "unknown",
+          ...(entry.discrepancies ? { discrepancies: entry.discrepancies } : {}),
+        })),
       deliveryPublished,
     };
   }
 }
 
-function classifyFailure(error: unknown): { status: Exclude<EntryStatus, "pending" | "delivered">; reason: string } {
+function classifyFailure(error: unknown): {
+  status: Exclude<EntryStatus, "pending" | "delivered">;
+  reason: string;
+  discrepancies?: ReturnType<typeof verifyAgainstDeclaration>;
+} {
+  if (error instanceof VerificationError) {
+    return {
+      status: "failed",
+      reason: `Declaration verification failed: ${describeDiscrepancies(error.discrepancies)}`,
+      discrepancies: error.discrepancies,
+    };
+  }
   if (error instanceof SiteFetchError && error.status === 404) {
     return { status: "missing", reason: `Site reports the report unavailable (${error.code ?? "404"})` };
   }

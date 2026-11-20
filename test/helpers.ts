@@ -8,7 +8,7 @@ import path from "node:path";
 import { MockAssaySite, type SiteHandle, type SiteOptions } from "../src/site/server.js";
 import { Collector } from "../src/collector/runner.js";
 import { startCollectorService, type CollectorHandle } from "../src/collector/server.js";
-import type { ProgressSnapshot, ReportRecord } from "../src/shared/types.js";
+import type { ProgressSnapshot, ReportDeclaration, ReportRecord } from "../src/shared/types.js";
 
 export type CollectorChild = ChildProcessByStdio<null, Readable, Readable>;
 
@@ -185,4 +185,32 @@ export function bodyRequestCounts(
     counts.set(reportNo, (counts.get(reportNo) ?? 0) + 1);
   }
   return counts;
+}
+
+/** Read the directory manifest the site publishes as its declaration. */
+export async function fetchManifest(siteUrl: string): Promise<{
+  snapshotId: string;
+  reports: ReportDeclaration[];
+}> {
+  const response = await fetch(`${siteUrl}/reports`);
+  if (response.status !== 200) throw new Error(`manifest fetch HTTP ${response.status}`);
+  const html = await response.text();
+  const match = /<script id="assay-manifest"[^>]*>([\s\S]*?)<\/script>/.exec(html);
+  if (!match) throw new Error("manifest block not found in directory page");
+  return JSON.parse(match[1]!) as { snapshotId: string; reports: ReportDeclaration[] };
+}
+
+/** Arm a semantic content defect (omitSample / omitItem / duplicateItem / limitWithoutValue). */
+export async function armContentDefect(
+  siteUrl: string,
+  defect: {
+    type: "omitSample" | "omitItem" | "duplicateItem" | "limitWithoutValue";
+    reportNo: string;
+    times?: number;
+    sampleId?: string;
+    itemCode?: string;
+    sourceItemCode?: string;
+  },
+): Promise<void> {
+  await armFault(siteUrl, defect);
 }

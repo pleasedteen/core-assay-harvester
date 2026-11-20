@@ -16,10 +16,12 @@ import { computeSignature, NONCE_HEADER, SESSION_HEADER, SIGNATURE_HEADER } from
 import type { ReportRecord, Sample } from "../src/shared/types.js";
 import { MockAssaySite } from "../src/site/server.js";
 import {
+  armContentDefect,
   armFault,
   assertNoDuplicateReports,
   bodyRequestCounts,
   download,
+  fetchManifest,
   getProgress,
   publish,
   readStoredReport,
@@ -457,6 +459,347 @@ describe("snapshots and layout", () => {
         assert.ok(entry.measurement.rawUnit === entry.measurement.rawUnit);
       }
     }
+  });
+});
+
+describe("declaration verification", () => {
+  test("declared samples and per-sample items are satisfied in both layouts; explicit missing stays valid", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    const manifest = await fetchManifest(h.site.url);
+    assert.equal(manifest.reports.length, 6);
+
+    await startCollect(h.service.url, h.site.url);
+    const progress = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(progress.state, "complete", progress.lastError ?? "");
+
+    const result = await download(h.service.url);
+    assert.equal(result.records.length, 6);
+
+    // Every record matches its manifest declaration sample-for-sample and
+    // item-for-item; item sets are allowed to differ between samples.
+    for (const record of result.records) {
+      const declaration = manifest.reports.find((entry) => entry.reportNo === record.reportNo)!;
+      assert.equal(declaration.revision, record.revision);
+      assert.equal(record.samples.length, declaration.samples.length);
+      for (const declaredSample of declaration.samples) {
+        const sample = record.samples.find((candidate) => candidate.sampleId === declaredSample.sampleId);
+        assert.ok(sample, `${record.reportNo} must contain declared sample ${declaredSample.sampleId}`);
+        const codes = sample!.items.map((item) => item.code).sort();
+        assert.deepEqual(
+          codes,
+          declaredSample.items.map((item) => item.code).sort(),
+          `${record.reportNo}/${sample!.sampleId} item set must match the manifest`,
+        );
+        const unique = new Set(sample!.items.map((item) => item.code));
+        assert.equal(unique.size, sample!.items.length, "no duplicate detection items");
+      }
+    }
+
+    // At least one report genuinely has differing per-sample item sets.
+    const varied = manifest.reports.some((report) => {
+      const sets = report.samples.map((sample) => sample.items.map((item) => item.code).sort().join(","));
+      return new Set(sets).size > 1;
+    });
+    assert.ok(varied, "manifest should include reports whose samples differ in detection items");
+
+    // Explicitly marked missing ("—") is a valid result, not a discrepancy.
+    const missing = result.records.flatMap(allMeasurements).filter((entry) => entry.measurement.kind === "missing");
+    assert.ok(missing.length >= 1);
+    assert.deepEqual(progress.failed, []);
+  });
+
+  test("the same manifest verifies under classic and compact layout switches", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "classic" } });
+    const classicManifest = await fetchManifest(h.site.url);
+    await startCollect(h.service.url, h.site.url);
+    const classicProgress = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(classicProgress.state, "complete", classicProgress.lastError ?? "");
+    const classic = await download(h.service.url);
+
+    await publish(h.site.url, { layout: "compact", reportNos: [] });
+    const compactManifest = await fetchManifest(h.site.url);
+    // Layout only changes presentation; the declaration itself is unchanged.
+    assert.deepEqual(compactManifest.reports, classicManifest.reports);
+    await startCollect(h.service.url, h.site.url, { fresh: true });
+    const compactProgress = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(compactProgress.state, "complete", compactProgress.lastError ?? "");
+    const compact = await download(h.service.url);
+
+    for (const compactRecord of compact.records) {
+      const classicRecord = classic.records.find((record) => record.reportNo === compactRecord.reportNo)!;
+      assert.deepEqual(sampleSnapshot(compactRecord.samples), sampleSnapshot(classicRecord.samples));
+      const declaration = compactManifest.reports.find(
+        (entry) => entry.reportNo === compactRecord.reportNo,
+      )!;
+      for (const sample of compactRecord.samples) {
+        const declared = declaration.samples.find((entry) => entry.sampleId === sample.sampleId)!;
+        assert.deepEqual(
+          sample.items.map((item) => item.code).sort(),
+          declared.items.map((item) => item.code).sort(),
+        );
+      }
+    }
+  });
+});
+
+describe("content defects vs declarations", () => {
+  async function defectTarget(
+    siteUrl: string,
+    reportNo: string,
+    predicate: (itemCode: string) => boolean = () => true,
+  ): Promise<{ sampleId: string; itemCode: string }> {
+    const manifest = await fetchManifest(siteUrl);
+    const report = manifest.reports.find((entry) => entry.reportNo === reportNo)!;
+    for (const sample of [...report.samples].reverse()) {
+      const item = [...sample.items].reverse().find((candidate) => predicate(candidate.code));
+      if (item) return { sampleId: sample.sampleId, itemCode: item.code };
+    }
+    throw new Error(`no defect target found in ${reportNo}`);
+  }
+
+  test("missing sample row: progress names the missing sample and the run fails", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    const manifest = await fetchManifest(h.site.url);
+    const targetReport = "R-0006"; // five samples, spans three appendix pages
+    const report = manifest.reports.find((entry) => entry.reportNo === targetReport)!;
+    const missingSample = report.samples[report.samples.length - 1]!;
+    await armContentDefect(h.site.url, {
+      type: "omitSample",
+      reportNo: targetReport,
+      sampleId: missingSample.sampleId,
+    });
+
+    await startCollect(h.service.url, h.site.url);
+    const failed = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(failed.state, "failed");
+    const entry = failed.failed.find((item) => item.reportNo === targetReport)!;
+    assert.ok(entry, "the defective report must appear in failed[]");
+    const discrepancy = entry.discrepancies!.find((issue) => issue.type === "sample_missing")!;
+    assert.ok(discrepancy);
+    assert.equal(discrepancy.sampleId, missingSample.sampleId);
+    // The items lost with the sample are named too.
+    assert.ok(
+      entry.discrepancies!.some(
+        (issue) => issue.type === "item_missing" && issue.sampleId === missingSample.sampleId,
+      ),
+    );
+    assert.equal((await download(h.service.url)).status, 404, "no delivery while the snapshot is incomplete");
+
+    // Once the one-shot defect is consumed, a resume re-fetches and passes.
+    await startCollect(h.service.url, h.site.url);
+    const complete = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(complete.state, "complete", complete.lastError ?? "");
+    const result = await download(h.service.url);
+    assert.equal(result.records.length, 6);
+  });
+
+  test("missing detection column on an appendix page: progress names sample and item", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    // R-0006 has appendix samples; pick an item of its last (appendix-only) sample.
+    const target = await defectTarget(h.site.url, "R-0006");
+    await armContentDefect(h.site.url, { type: "omitItem", reportNo: "R-0006", ...target });
+
+    await startCollect(h.service.url, h.site.url);
+    const failed = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(failed.state, "failed");
+    const entry = failed.failed.find((item) => item.reportNo === "R-0006")!;
+    const discrepancy = entry.discrepancies!.find((issue) => issue.type === "item_missing")!;
+    assert.ok(discrepancy, JSON.stringify(entry));
+    assert.equal(discrepancy.sampleId, target.sampleId);
+    assert.equal(discrepancy.itemCode, target.itemCode);
+    assert.match(entry.reason, new RegExp(`${target.sampleId}`));
+  });
+
+  test("duplicate item substitution in compact layout is detected with both codes named", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "compact" } });
+    const target = await defectTarget(h.site.url, "R-0002", (code) => code !== "Au");
+    const manifest = await fetchManifest(h.site.url);
+    const report = manifest.reports.find((entry) => entry.reportNo === "R-0002")!;
+    const sample = report.samples.find((entry) => entry.sampleId === target.sampleId)!;
+    const source = sample.items.find((item) => item.code !== target.itemCode)!;
+
+    await armContentDefect(h.site.url, {
+      type: "duplicateItem",
+      reportNo: "R-0002",
+      sampleId: target.sampleId,
+      itemCode: target.itemCode,
+      sourceItemCode: source.code,
+    });
+
+    await startCollect(h.service.url, h.site.url);
+    const failed = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(failed.state, "failed");
+    const entry = failed.failed.find((item) => item.reportNo === "R-0002")!;
+    const duplicated = entry.discrepancies!.find(
+      (issue) => issue.type === "item_duplicated" && issue.itemCode === source.code,
+    );
+    assert.ok(duplicated, JSON.stringify(entry.discrepancies));
+    assert.equal(duplicated.sampleId, target.sampleId);
+    const missing = entry.discrepancies!.find(
+      (issue) => issue.type === "item_missing" && issue.itemCode === target.itemCode,
+    );
+    assert.ok(missing, "the substituted declared item must be reported missing");
+  });
+
+  test("detection limit without a numeric value names the sample and item; explicit 缺测 still valid", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    // A below-detection-limit-capable value item on R-0004.
+    const target = await defectTarget(h.site.url, "R-0004", (code) => code === "Au" || code === "Ag");
+    await armContentDefect(h.site.url, { type: "limitWithoutValue", reportNo: "R-0004", ...target });
+
+    await startCollect(h.service.url, h.site.url);
+    const failed = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(failed.state, "failed");
+    const entry = failed.failed.find((item) => item.reportNo === "R-0004")!;
+    const discrepancy = entry.discrepancies!.find((issue) => issue.type === "limit_without_value")!;
+    assert.ok(discrepancy, JSON.stringify(entry));
+    assert.equal(discrepancy.sampleId, target.sampleId);
+    assert.equal(discrepancy.itemCode, target.itemCode);
+
+    // Meanwhile, an explicitly marked missing measurement ("—") in the same
+    // snapshot is never turned into a discrepancy.
+    const others = entry.discrepancies!.filter((issue) => issue.type !== "limit_without_value");
+    assert.ok(
+      !others.some((issue) => issue.detail.includes("缺测")),
+      "explicit missing measurements must stay valid",
+    );
+
+    // The defect is one-shot; resume clears the failure and delivers.
+    await startCollect(h.service.url, h.site.url);
+    const complete = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(complete.state, "complete", complete.lastError ?? "");
+  });
+});
+
+describe("resume against an old cache directory", () => {
+  test("an intact cache is verified from the directory manifest only and never refetched", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    await startCollect(h.service.url, h.site.url);
+    const first = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(first.state, "complete", first.lastError ?? "");
+    const firstDelivery = await download(h.service.url);
+    assert.equal(firstDelivery.status, 200);
+
+    const requestsBeforeResume = (await siteRequests(h.site.url)).length;
+
+    // Resume the same data directory without any content change.
+    await startCollect(h.service.url, h.site.url);
+    const resumed = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(resumed.state, "complete", resumed.lastError ?? "");
+    assert.equal(resumed.deliveredReports, 6);
+
+    // Cache verification only reads the directory: no report body or appendix
+    // page may have been requested during the resumed run — only index
+    // (directory) entries should have been appended.
+    const requestsAfterResume = await siteRequests(h.site.url);
+    const newRequests = requestsAfterResume.slice(requestsBeforeResume);
+    assert.ok(newRequests.length > 0, "the resumed run must at least re-enter the directory");
+    assert.ok(
+      newRequests.every((request) => request.note === "index"),
+      `resume fetched report pages: ${JSON.stringify(newRequests.map((request) => request.note))}`,
+    );
+    const second = await download(h.service.url);
+    assert.equal(second.raw, firstDelivery.raw);
+  });
+
+  test("a cache that no longer matches the manifest is re-collected from body and appendices", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+    await startCollect(h.service.url, h.site.url);
+    const first = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(first.state, "complete", first.lastError ?? "");
+    const firstDelivery = await download(h.service.url);
+
+    // Corrupt one cached report file on disk (simulating a stale/tampered
+    // cache): drop a whole detection item from one sample.
+    const storedPath = path.join(
+      h.dataDir,
+      "snapshots",
+      first.snapshotId!,
+      "reports",
+      "R-0001.json",
+    );
+    const cached = JSON.parse(await readFile(storedPath, "utf8")) as ReportRecord;
+    const victimSample = cached.samples[cached.samples.length - 1]!;
+    const victimItem = victimSample.items[victimSample.items.length - 1]!;
+    victimSample.items = victimSample.items.filter((item) => item.code !== victimItem.code);
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(storedPath, `${JSON.stringify(cached)}\n`);
+
+    const countsBeforeResume = bodyRequestCounts(await siteRequests(h.site.url));
+
+    await startCollect(h.service.url, h.site.url);
+    const resumed = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(resumed.state, "complete", resumed.lastError ?? "");
+
+    // The corrupted report alone was re-fetched (body + its pages); the other
+    // five intact reports were verified from the manifest and not requested.
+    const countsAfterResume = bodyRequestCounts(await siteRequests(h.site.url));
+    assert.equal(
+      (countsAfterResume.get("R-0001") ?? 0) - (countsBeforeResume.get("R-0001") ?? 0),
+      1,
+      "the unverifiable cached report must be re-collected once",
+    );
+    for (const reportNo of ["R-0002", "R-0003", "R-0004", "R-0005", "R-0006"]) {
+      assert.equal(
+        (countsAfterResume.get(reportNo) ?? 0) - (countsBeforeResume.get(reportNo) ?? 0),
+        0,
+        `${reportNo} cache should have been trusted`,
+      );
+    }
+
+    const repaired = await readStoredReport(h.dataDir, first.snapshotId!, "R-0001");
+    const repairedSample = repaired.samples.find((sample) => sample.sampleId === victimSample.sampleId)!;
+    assert.ok(
+      repairedSample.items.some((item) => item.code === victimItem.code),
+      "re-collected report restores the missing detection item",
+    );
+    const redelivery = await download(h.service.url);
+    assert.equal(redelivery.records.length, 6);
+    assert.notEqual(redelivery.raw, firstDelivery.raw);
+  });
+
+  test("a persistent content defect keeps the previous delivery until verification passes", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "classic" } });
+    // Build a complete baseline delivery first.
+    await startCollect(h.service.url, h.site.url);
+    const baseline = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(baseline.state, "complete", baseline.lastError ?? "");
+    const baselineDelivery = await download(h.service.url);
+    assert.equal(baselineDelivery.status, 200);
+
+    // Publish a new revision so a fresh run targets a snapshot whose reports
+    // are not cached yet, then arm a persistent defect against one of them.
+    const nextSnapshot = await publish(h.site.url, { reportNos: ["R-0005"] });
+    const target = await (async () => {
+      const manifest = await fetchManifest(h.site.url);
+      const report = manifest.reports.find((entry) => entry.reportNo === "R-0005")!;
+      const sample = report.samples[report.samples.length - 1]!;
+      return { sampleId: sample.sampleId, itemCode: sample.items[sample.items.length - 1]!.code };
+    })();
+    await armContentDefect(h.site.url, { type: "omitItem", reportNo: "R-0005", times: 10, ...target });
+
+    await startCollect(h.service.url, h.site.url, { fresh: true });
+    const failedRun = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(failedRun.state, "failed");
+    assert.equal(failedRun.snapshotId, nextSnapshot.id);
+    const entry = failedRun.failed.find((item) => item.reportNo === "R-0005")!;
+    assert.ok(entry.discrepancies!.some((issue) => issue.type === "item_missing"));
+    assert.ok(entry.discrepancies!.some((issue) => issue.sampleId === target.sampleId));
+
+    // The previous complete delivery stays available byte-for-byte.
+    const duringFailure = await download(h.service.url);
+    assert.equal(duringFailure.status, 200);
+    assert.equal(duringFailure.raw, baselineDelivery.raw);
+
+    // Clear the defect: the resume re-collects, verification passes and a new
+    // delivery is published.
+    await fetch(`${h.site.url}/__control/faults/clear`, { method: "POST" });
+    await startCollect(h.service.url, h.site.url);
+    const complete = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(complete.state, "complete", complete.lastError ?? "");
+    const finalDelivery = await download(h.service.url);
+    assert.equal(finalDelivery.records.length, 6);
+    assert.notEqual(finalDelivery.raw, baselineDelivery.raw);
   });
 });
 

@@ -10,6 +10,7 @@ import {
   computeSignature,
 } from "../shared/protocol.js";
 import { ParseError } from "./parse.js";
+import type { ReportDeclaration } from "../shared/types.js";
 
 export interface DirectoryEntry {
   reportNo: string;
@@ -21,6 +22,64 @@ export interface DirectoryPage {
   snapshotId: string;
   indexUrl: string;
   entries: DirectoryEntry[];
+  /** Per-report declarations of samples and their detection items. */
+  declarations: ReportDeclaration[];
+}
+
+/** Parse the embedded assay manifest declaring samples and per-sample items. */
+export function parseManifest(html: string, snapshotId: string): ReportDeclaration[] {
+  const $ = cheerio.load(html);
+  const raw = $('script#assay-manifest[type="application/json"]').first().html();
+  if (!raw) throw new ParseError("Directory page is missing the assay manifest declaration");
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(raw);
+  } catch (error) {
+    throw new ParseError(
+      `Assay manifest is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const reports = (manifest as { reports?: unknown } | null)?.reports;
+  if (!Array.isArray(reports)) {
+    throw new ParseError("Assay manifest must contain a reports array");
+  }
+  const declarations: ReportDeclaration[] = [];
+  for (const entry of reports) {
+    const report = entry as Partial<ReportDeclaration> | null;
+    if (
+      !report ||
+      typeof report.reportNo !== "string" ||
+      !Number.isInteger(report.revision) ||
+      !Array.isArray(report.samples)
+    ) {
+      throw new ParseError("Assay manifest contains a malformed report declaration");
+    }
+    const samples = report.samples.map((sample) => {
+      const declared = sample as ReportDeclaration["samples"][number];
+      if (
+        !declared ||
+        typeof declared.sampleId !== "string" ||
+        !Array.isArray(declared.items) ||
+        declared.items.some(
+          (item) => !item || typeof item.code !== "string" || typeof item.name !== "string",
+        )
+      ) {
+        throw new ParseError(`Assay manifest report ${report.reportNo} has a malformed sample declaration`);
+      }
+      return {
+        sampleId: declared.sampleId,
+        items: declared.items.map((item) => ({ code: item.code, name: item.name })),
+      };
+    });
+    declarations.push({ reportNo: report.reportNo, revision: report.revision!, samples });
+  }
+  const manifestSnapshot = (manifest as { snapshotId?: unknown } | null)?.snapshotId;
+  if (typeof manifestSnapshot === "string" && manifestSnapshot !== snapshotId) {
+    throw new ParseError(
+      `Assay manifest snapshot ${manifestSnapshot} does not match directory snapshot ${snapshotId}`,
+    );
+  }
+  return declarations;
 }
 
 export class SiteFetchError extends Error {
@@ -85,7 +144,20 @@ export function parseDirectoryPage(html: string, baseUrl: string): DirectoryPage
     },
   );
   if (entries.length === 0) throw new ParseError("Directory page contains no report entries");
-  return { snapshotId, indexUrl: new URL("/reports", baseUrl).toString(), entries };
+  const declarations = parseManifest(html, snapshotId);
+  const declaredReports = new Map(declarations.map((declaration) => [declaration.reportNo, declaration]));
+  for (const entry of entries) {
+    const declaration = declaredReports.get(entry.reportNo);
+    if (!declaration) {
+      throw new ParseError(`Assay manifest has no declaration for listed report ${entry.reportNo}`);
+    }
+    if (declaration.revision !== entry.revision) {
+      throw new ParseError(
+        `Assay manifest revision ${declaration.revision} for ${entry.reportNo} does not match directory revision ${entry.revision}`,
+      );
+    }
+  }
+  return { snapshotId, indexUrl: new URL("/reports", baseUrl).toString(), entries, declarations };
 }
 
 export interface SignedClientOptions {

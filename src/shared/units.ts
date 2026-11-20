@@ -85,6 +85,28 @@ export function belowDetectionLimit(
   };
 }
 
+/**
+ * A below-detection-limit cell that publishes a unit but no numeric limit
+ * ("< mg/kg"). The record keeps the published text; declaration verification
+ * flags it because the detection limit cannot be quantified.
+ */
+export function belowDetectionLimitWithoutValue(
+  limitUnit: ContentUnit,
+  rawText = "<",
+): Measurement {
+  return {
+    kind: "below_detection_limit",
+    rawText,
+    rawValue: null,
+    rawUnit: null,
+    mgPerKg: null,
+    mgPerKgExact: null,
+    detectionLimitMgPerKg: null,
+    detectionLimitRaw: null,
+    detectionLimitUnit: limitUnit,
+  };
+}
+
 export function missingMeasurement(rawText = "—"): Measurement {
   return {
     kind: "missing",

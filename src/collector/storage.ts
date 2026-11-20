@@ -3,7 +3,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { ProgressSnapshot, ReportRecord } from "../shared/types.js";
+import type {
+  DeclarationDiscrepancy,
+  ProgressSnapshot,
+  ReportDeclaration,
+  ReportRecord,
+} from "../shared/types.js";
 
 export type EntryStatus = "pending" | "delivered" | "missing" | "failed";
 
@@ -13,6 +18,7 @@ export interface RunEntry {
   status: EntryStatus;
   reason?: string;
   sampleCount?: number;
+  discrepancies?: DeclarationDiscrepancy[];
 }
 
 export interface PersistedRun {
@@ -24,6 +30,8 @@ export interface PersistedRun {
   indexUrl: string;
   expectedReports: number;
   entries: RunEntry[];
+  /** Declarations captured from the pinned directory at run time. */
+  declarations?: ReportDeclaration[];
   startedAt: string;
   updatedAt: string;
   finishedAt: string | null;
@@ -209,7 +217,11 @@ export function toProgress(
   const delivered = run.entries.filter((entry) => entry.status === "delivered");
   const failed = run.entries
     .filter((entry) => entry.status === "failed")
-    .map((entry) => ({ reportNo: entry.reportNo, reason: entry.reason ?? "unknown" }));
+    .map((entry) => ({
+      reportNo: entry.reportNo,
+      reason: entry.reason ?? "unknown",
+      ...(entry.discrepancies ? { discrepancies: entry.discrepancies } : {}),
+    }));
   const missing = run.entries
     .filter((entry) => entry.status === "missing")
     .map((entry) => ({ reportNo: entry.reportNo, reason: entry.reason ?? "missing from snapshot" }));
