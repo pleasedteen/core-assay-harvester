@@ -46,6 +46,7 @@ export interface RunResult {
   missing: Array<{ reportNo: string; reason: string }>;
   failed: Array<{ reportNo: string; reason: string }>;
   deliveryPublished: boolean;
+  cleanup: string[];
 }
 
 class CollectAborted extends Error {
@@ -69,6 +70,10 @@ export class Collector {
   private starting = false;
   private lastError: string | null = null;
   private readonly reportAttempts: number;
+  /** Run id named by the current delivery pointer; null when there is none. */
+  private committedRunId: string | null = null;
+  /** Last cleanup problem, surfaced in progress but never fatal to a run. */
+  private cleanupError: string | null = null;
 
   constructor(options: CollectorOptions) {
     this.options = {
@@ -87,6 +92,9 @@ export class Collector {
 
   /** Restore persisted state. A run left "running" means the process died mid-flight. */
   async init(): Promise<void> {
+    // Finish (or discard) any commit the previous process left half-done, and
+    // remove stale temp files, before reading state into memory.
+    await this.recover();
     const run = await this.store.loadRun();
     if (!run) return;
     if (run.state === "running") {
@@ -96,6 +104,55 @@ export class Collector {
     }
     this.activeRun = run;
     this.lastError = run.lastError;
+    await this.refreshCommitState();
+  }
+
+  /**
+   * Reconcile the persisted run with the delivery pointer after a restart.
+   *
+   * The pointer names the run it commits. If it names the persisted run but the
+   * run state still says `running`/`interrupted`, the previous process died
+   * between swapping the pointer and persisting `complete`; the commit already
+   * happened, so mark the run complete rather than re-collecting it. Conversely
+   * a `complete` run whose pointer names a different (or no) run means its
+   * commit did not survive, so it is downgraded to `interrupted` and the next
+   * `collect` re-publishes from the reports already on disk.
+   */
+  private async recover(): Promise<void> {
+    await this.store.cleanupTemporaryFiles().then(
+      (report) => this.recordCleanup(report.failed),
+      (error) => this.recordCleanup([describe(error)]),
+    );
+    const [run, pointer] = await Promise.all([this.store.loadRun(), this.store.readDeliveryPointer()]);
+    if (run) {
+      const committed = pointer?.runId === run.runId;
+      if (run.state === "complete" && !committed) {
+        run.state = "interrupted";
+        run.finishedAt = null;
+        run.lastError = "Delivery pointer does not name this run; completion must be re-committed.";
+        await this.store.saveRun(run);
+      } else if (run.state !== "complete" && committed) {
+        run.state = "complete";
+        run.deliveryFile = pointer.file;
+        run.finishedAt = pointer.createdAt;
+        run.lastError = null;
+        await this.store.saveRun(run);
+      }
+    }
+    const cleanup = await this.store.cleanupDeliveries().catch((error) => {
+      this.recordCleanup([describe(error)]);
+      return null;
+    });
+    if (cleanup) this.recordCleanup(cleanup.failed);
+  }
+
+  private async refreshCommitState(): Promise<void> {
+    const pointer = await this.store.readDeliveryPointer();
+    this.committedRunId = pointer?.runId ?? null;
+  }
+
+  private recordCleanup(failures: string[]): void {
+    this.cleanupError = failures.length > 0 ? `cleanup failed: ${failures.join("; ")}` : null;
   }
 
   isRunning(): boolean {
@@ -141,6 +198,7 @@ export class Collector {
       run = await this.createFreshRun();
       this.activeRun = null;
     }
+    await this.refreshCommitState();
     run.startedAt = run.startedAt || new Date().toISOString();
     run.lastError = null;
     await this.store.saveRun(run);
@@ -151,10 +209,21 @@ export class Collector {
     this.activePromise = this.execute(run)
       .catch(async (error) => {
         const message = error instanceof Error ? error.message : String(error);
+        // A throw after the pointer swap must not undo a committed delivery.
+        await this.refreshCommitState();
+        if (this.committedRunId === run.runId) {
+          run.state = "complete";
+          this.lastError = null;
+          await this.store.saveRun(run).catch(() => undefined);
+          return this.resultFromRun(run, true);
+        }
+        // The run failed before committing. If it reached "all reports on
+        // disk" (e.g. died right before the pointer swap) we still must not
+        // claim success; record the reason and leave the previous delivery.
         run.state = "failed";
         run.lastError = message;
         this.lastError = message;
-        await this.store.saveRun(run);
+        await this.store.saveRun(run).catch(() => undefined);
         return this.resultFromRun(run, false);
       })
       .finally(() => {
@@ -194,6 +263,7 @@ export class Collector {
       finishedAt: null,
       lastError: null,
       resumedFrom: null,
+      deliveryFile: null,
     };
   }
 
@@ -298,22 +368,37 @@ export class Collector {
       return this.resultFromRun(run, false);
     }
 
-    // Complete snapshot: atomically publish a new delivery, leaving the
-    // previous one fully downloadable until the pointer swap.
+    // Complete snapshot: write the immutable delivery, swap the pointer that
+    // names this run, then persist `complete`. Until the pointer swap the
+    // previous delivery stays downloadable; after it, the pointer itself says
+    // this run was committed, so a crash before the state write is recoverable.
     const pointer = await this.store.publishDelivery(
-      run.snapshotId,
+      run,
       delivered.map((entry) => entry.reportNo),
     );
+    run.deliveryFile = pointer.file;
     run.state = "complete";
-    run.finishedAt = new Date().toISOString();
+    run.finishedAt = pointer.createdAt;
     run.lastError = null;
     this.lastError = null;
-    await this.store.saveRun(run);
+    try {
+      await this.store.saveRun(run);
+    } catch (error) {
+      // The pointer already committed this run; recovery will finish the state
+      // write on restart. Surface it, but never report the delivery as failed.
+      this.recordCleanup([`state write after commit: ${describe(error)}`]);
+    }
+    this.committedRunId = run.runId;
     if (pointer.reports !== delivered.length) {
       throw new CollectAborted(
         `Delivery contains ${pointer.reports} reports, expected ${delivered.length}`,
       );
     }
+    const cleanup = await this.store.cleanupDeliveries().catch((error) => {
+      this.recordCleanup([describe(error)]);
+      return null;
+    });
+    if (cleanup) this.recordCleanup(cleanup.failed);
     return this.resultFromRun(run, true);
   }
 
@@ -395,10 +480,20 @@ export class Collector {
   }
 
   progress(): ProgressSnapshot {
-    if (this.liveState === "running" && this.activeRun) {
-      return { ...toProgress(this.activeRun, "running"), lastError: this.lastError };
-    }
-    return toProgress(this.activeRun, null, 0, this.lastError);
+    const run = this.activeRun;
+    // The pointer swap is the commit point. If it names this run, report the
+    // run as complete (and delivered) immediately, so `progress` and
+    // `/api/download` can never disagree while the state write catches up.
+    const committed = run !== null && this.committedRunId === run.runId;
+    const liveState: ProgressSnapshot["state"] | null = committed
+      ? "complete"
+      : this.liveState === "running"
+        ? "running"
+        : null;
+    const base = toProgress(run, liveState, 0, this.lastError, this.committedRunId);
+    // A cleanup problem is surfaced as lastError only when the run itself has
+    // nothing more important to report.
+    return this.cleanupError && !base.lastError ? { ...base, lastError: this.cleanupError } : base;
   }
 
   private resultFromRun(run: PersistedRun, deliveryPublished: boolean): RunResult {
@@ -415,6 +510,7 @@ export class Collector {
         .filter((entry) => entry.status === "failed")
         .map((entry) => ({ reportNo: entry.reportNo, reason: entry.reason ?? "unknown" })),
       deliveryPublished,
+      cleanup: this.cleanupError ? [this.cleanupError] : [],
     };
   }
 }

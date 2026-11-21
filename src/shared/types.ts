@@ -76,4 +76,11 @@ export interface ProgressSnapshot {
   finishedAt: string | null;
   lastError: string | null;
   resumedFrom: string | null;
+  /**
+   * True when the current delivery pointer was committed for exactly this run.
+   * Survives restarts: a run whose state says `complete` (or was interrupted
+   * right after the commit) can be distinguished from one that only reached
+   * "all reports on disk" but never committed a delivery.
+   */
+  delivered: boolean;
 }

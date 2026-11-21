@@ -2,6 +2,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { ProgressSnapshot, ReportRecord } from "../shared/types.js";
 
@@ -29,9 +30,13 @@ export interface PersistedRun {
   finishedAt: string | null;
   lastError: string | null;
   resumedFrom: string | null;
+  /** Immutable delivery file published by this run, if its commit happened. */
+  deliveryFile: string | null;
 }
 
 export interface DeliveryPointer {
+  /** The run whose completion is committed by this pointer. */
+  runId: string;
   file: string;
   snapshotId: string;
   reports: number;
@@ -40,14 +45,21 @@ export interface DeliveryPointer {
   createdAt: string;
 }
 
+export interface CleanupReport {
+  removed: string[];
+  failed: string[];
+}
+
 const RUN_STATE = "state.json";
 const DELIVERY_POINTER = "current-delivery.json";
 const TMP_SUFFIX = ".tmp";
+/** Maximum number of immutable delivery files retained after cleanup. */
+export const DELIVERY_RETENTION = 3;
 
 async function writeFileAtomic(filePath: string, data: string | Buffer): Promise<void> {
   const dir = path.dirname(filePath);
   await fs.mkdir(dir, { recursive: true });
-  const tmp = `${filePath}.${process.pid}.${Date.now()}${TMP_SUFFIX}`;
+  const tmp = `${filePath}.${process.pid}.${randomUUID().slice(0, 8)}${TMP_SUFFIX}`;
   const handle = await fs.open(tmp, "w");
   try {
     await handle.writeFile(data);
@@ -120,64 +132,181 @@ export class CollectorStore {
   }
 
   /**
-   * Build a delivery file from all reports and atomically swap the pointer.
-   * The previous delivery remains downloadable until the swap.
+   * Write the immutable delivery file for a completed run, then commit it by
+   * atomically swapping the pointer and (in the same state write) marking the
+   * run complete. Two separate atomic replacements cannot be atomic together,
+   * so the pointer records the run id it belongs to: recovery and `progress`
+   * compare it with the persisted run to tell whether *this* run was committed.
+   *
+   * The write is therefore: (1) fsync the new immutable file, (2) atomically
+   * replace the pointer, (3) persist the run as complete with `deliveryFile`.
+   * If the process dies after (2) but before (3), the pointer already names the
+   * run and recovery can finish the commit; if it dies before (2), the pointer
+   * still names the previous delivery and this run stays resumable.
    */
-  async publishDelivery(snapshotId: string, reportNos: string[]): Promise<DeliveryPointer> {
+  async publishDelivery(run: PersistedRun, reportNos: string[]): Promise<DeliveryPointer> {
+    const body = await this.buildDeliveryBody(run.snapshotId, reportNos);
+    const deliveriesDir = path.join(this.root, "deliveries");
+    await fs.mkdir(deliveriesDir, { recursive: true });
+    // Every delivery is a new immutable file. A reader that has opened an older
+    // file keeps reading a complete, self-consistent body even if cleanup later
+    // unlinks the name.
+    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+    const fileName = `delivery-${run.snapshotId}-${stamp}-${randomUUID().slice(0, 8)}.jsonl`;
+    const finalPath = path.join(deliveriesDir, fileName);
+    await writeFileAtomic(finalPath, body);
+    const pointer: DeliveryPointer = {
+      runId: run.runId,
+      file: fileName,
+      snapshotId: run.snapshotId,
+      reports: reportNos.length,
+      bytes: Buffer.byteLength(body),
+      sha256: createHash("sha256").update(body).digest("hex"),
+      createdAt: new Date().toISOString(),
+    };
+    await writeFileAtomic(path.join(this.root, DELIVERY_POINTER), `${JSON.stringify(pointer, null, 2)}\n`);
+    return pointer;
+  }
+
+  /** Serialize all reports of one snapshot in a stable report-number order. */
+  private async buildDeliveryBody(snapshotId: string, reportNos: string[]): Promise<string> {
     const lines: string[] = [];
-    const reports: ReportRecord[] = [];
+    const seen = new Set<string>();
     for (const reportNo of [...reportNos].sort()) {
+      if (seen.has(reportNo)) throw new Error(`Duplicate report ${reportNo} in delivery`);
+      seen.add(reportNo);
       const raw = await readJson<ReportRecord>(this.reportFile(snapshotId, reportNo));
       if (!raw) throw new Error(`Missing stored report ${reportNo}`);
       if (raw.snapshotId !== snapshotId) {
         throw new Error(`Stored report ${reportNo} belongs to snapshot ${raw.snapshotId}`);
       }
-      reports.push(raw);
       lines.push(JSON.stringify(raw));
     }
-    const body = `${lines.join("\n")}\n`;
-    const deliveriesDir = path.join(this.root, "deliveries");
-    await fs.mkdir(deliveriesDir, { recursive: true });
-    // Every delivery is a new immutable file. A reader holding an older
-    // pointer therefore never races with a concurrent publish.
-    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-    const fileName = `delivery-${snapshotId}-${stamp}-${randomUUID().slice(0, 8)}.jsonl`;
-    const finalPath = path.join(deliveriesDir, fileName);
-    await writeFileAtomic(finalPath, body);
-    const sha256 = createHash("sha256").update(body).digest("hex");
-    const pointer: DeliveryPointer = {
-      file: fileName,
-      snapshotId,
-      reports: reports.length,
-      bytes: Buffer.byteLength(body),
-      sha256,
-      createdAt: new Date().toISOString(),
-    };
-    await writeFileAtomic(path.join(this.root, DELIVERY_POINTER), `${JSON.stringify(pointer, null, 2)}\n`);
-    await this.pruneDeliveries(deliveriesDir, fileName, 3);
-    return pointer;
-  }
-
-  /** Keep only the newest few delivery files, never the one just published. */
-  private async pruneDeliveries(deliveriesDir: string, keepName: string, keepCount: number): Promise<void> {
-    const names = (await fs.readdir(deliveriesDir))
-      .filter((name) => name.endsWith(".jsonl"))
-      .sort()
-      .reverse();
-    const keep = new Set(names.slice(0, keepCount));
-    keep.add(keepName);
-    for (const name of names) {
-      if (keep.has(name)) continue;
-      await fs.unlink(path.join(deliveriesDir, name)).catch(() => undefined);
-    }
+    return `${lines.join("\n")}\n`;
   }
 
   async readDeliveryPointer(): Promise<DeliveryPointer | null> {
     return readJson<DeliveryPointer>(path.join(this.root, DELIVERY_POINTER));
   }
 
-  async readDelivery(pointer: DeliveryPointer): Promise<Buffer> {
-    return fs.readFile(path.join(this.root, "deliveries", pointer.file));
+  /**
+   * Open the delivery named by the current pointer and return a handle plus
+   * the exact size/sha256 of the file that handle refers to. The caller reads
+   * from the handle, so the headers it sends always describe the bytes it
+   * serves even if a publish or cleanup happens meanwhile.
+   *
+   * If the pointer rotates and cleanup unlinks the old name between reading the
+   * pointer and opening the file, retry with the newer pointer instead of
+   * failing the request.
+   */
+  async openDelivery(maxAttempts = 4): Promise<{ pointer: DeliveryPointer; handle: FileHandle; size: number } | null> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const pointer = await this.readDeliveryPointer();
+      if (!pointer) return null;
+      let handle: FileHandle;
+      try {
+        handle = await fs.open(path.join(this.root, "deliveries", pointer.file), "r");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        const latest = await this.readDeliveryPointer();
+        if (!latest || latest.file !== pointer.file) continue;
+        // The pointer still names a file that does not exist: there is no
+        // complete delivery we can honestly serve.
+        return null;
+      }
+      try {
+        const stat = await handle.stat();
+        if (stat.size !== pointer.bytes) {
+          throw new Error(
+            `Delivery file ${pointer.file} is ${stat.size} bytes but pointer says ${pointer.bytes}`,
+          );
+        }
+        return { pointer, handle, size: stat.size };
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        throw error;
+      }
+    }
+    throw new Error("Delivery pointer kept rotating; could not open a stable delivery");
+  }
+
+  /**
+   * Keep at most `DELIVERY_RETENTION` delivery files, never deleting the one
+   * the current pointer names. Unlinking a file a slow reader already opened
+   * is safe on POSIX: that reader keeps its complete snapshot.
+   *
+   * Returns which files were removed and which could not be removed, so the
+   * caller can report a cleanup failure instead of silently ignoring it. Files
+   * that vanish under us (e.g. a concurrent cleanup) are not failures.
+   */
+  async cleanupDeliveries(retention = DELIVERY_RETENTION): Promise<CleanupReport> {
+    const deliveriesDir = path.join(this.root, "deliveries");
+    const report: CleanupReport = { removed: [], failed: [] };
+    let names: string[];
+    try {
+      names = (await fs.readdir(deliveriesDir)).filter((name) => name.endsWith(".jsonl"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return report;
+      throw error;
+    }
+    const pointer = await this.readDeliveryPointer();
+    // Keep exactly the newest `retention` files, and always the one the pointer
+    // names even if it is somehow older than that window. Names start with the
+    // snapshot id, so they are NOT chronological: rank by mtime instead.
+    const ranked = await Promise.all(
+      names.map(async (name) => {
+        const stat = await fs.stat(path.join(deliveriesDir, name)).catch(() => null);
+        return { name, mtime: stat?.mtimeMs ?? 0 };
+      }),
+    );
+    ranked.sort((left, right) => right.mtime - left.mtime || right.name.localeCompare(left.name));
+    const keep = new Set<string>();
+    if (pointer) keep.add(pointer.file);
+    for (const { name } of ranked) {
+      if (keep.size >= Math.max(1, retention)) break;
+      keep.add(name);
+    }
+    for (const name of names) {
+      if (keep.has(name)) continue;
+      try {
+        await fs.unlink(path.join(deliveriesDir, name));
+        report.removed.push(name);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        report.failed.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return report;
+  }
+
+  /** Remove temporary files left behind by an interrupted atomic write. */
+  async cleanupTemporaryFiles(): Promise<CleanupReport> {
+    const report: CleanupReport = { removed: [], failed: [] };
+    const walk = async (dir: string): Promise<void> => {
+      let entries;
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(full);
+        } else if (entry.name.endsWith(TMP_SUFFIX)) {
+          try {
+            await fs.unlink(full);
+            report.removed.push(full);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+            report.failed.push(`${full}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
+    };
+    await walk(this.root);
+    return report;
   }
 }
 
@@ -186,6 +315,7 @@ export function toProgress(
   liveState: ProgressSnapshot["state"] | null,
   expectedReportsFallback = 0,
   lastErrorFallback: string | null = null,
+  committedRunId: string | null = null,
 ): ProgressSnapshot {
   if (!run) {
     return {
@@ -204,6 +334,7 @@ export function toProgress(
       finishedAt: null,
       lastError: null,
       resumedFrom: null,
+      delivered: false,
     };
   }
   const delivered = run.entries.filter((entry) => entry.status === "delivered");
@@ -230,5 +361,6 @@ export function toProgress(
     finishedAt: run.finishedAt,
     lastError: run.lastError ?? lastErrorFallback,
     resumedFrom: run.resumedFrom,
+    delivered: committedRunId !== null && committedRunId === run.runId,
   };
 }

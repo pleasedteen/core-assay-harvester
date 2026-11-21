@@ -6,7 +6,8 @@
 - 站点是纯本地、确定性内容生成器（固定种子），不访问任何外网，也不依赖时间或随机数来决定报告内容。
 - 采集结果以快照为单位物化，进程被杀后可用同一数据目录继续，已完整落盘的报告不会再请求。
 - 下载接口在采集和恢复期间始终返回上一份完整成果；首次完整交付前明确返回"尚无成果"。
-- `npm test` 用真实本地 HTTP 交互覆盖正常采集、会话恢复、响应中断、布局变化、进程重启，通常在 20–40 秒内结束。
+- 成果切换（下载指针）与本次运行完成状态共同由一次指针替换来判定，重启后 `progress.delivered` 可明确回答"这次是否已提交"。
+- `npm test` 用真实本地 HTTP 交互覆盖正常采集、会话恢复、响应中断、布局变化、进程重启、成果提交前后中断、清理失败与并发下载，通常在 20–40 秒内结束。
 
 ## 快速开始
 
@@ -106,8 +107,8 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 | 方法/路径 | 说明 |
 | --- | --- |
 | `POST /api/collect` | body `{"siteUrl":"...","fresh"?:"boolean","snapshotId"?:"string"}`。返回 `202 {accepted, runId, snapshotId, expectedReports}`，后台开始采集。已有未完成运行时默认**续跑**；`fresh:true` 归档旧运行并开始新快照；`snapshotId` 可固定进入某个历史快照。 |
-| `GET /api/progress` | `{progress, delivery, downloadUrl}`。`progress` 含 `state`（`idle/running/interrupted/failed/complete`）、`snapshotId`、`expectedReports`、`deliveredReports`、`pending`、`missing[]`、`failed[]`（含原因）、`lastError`、`resumedFrom`；`delivery` 是当前可下载的上一份完整成果（没有则为 `{available:false}`）。 |
-| `GET /api/download` | 返回最近一次**完整**交付的 JSONL（`application/x-ndjson`），响应头含 `x-snapshot-id`、`x-delivery-reports`、`x-delivery-sha256`。首次完整交付前返回 `404 {"error":"no_delivery"}`。 |
+| `GET /api/progress` | `{progress, delivery, downloadUrl}`。`progress` 含 `state`（`idle/running/interrupted/failed/complete`）、`snapshotId`、`expectedReports`、`deliveredReports`、`pending`、`missing[]`、`failed[]`（含原因）、`lastError`、`resumedFrom`、`delivered`（本次运行是否真的提交了成果，重启后依然可判断）；`delivery` 是当前可下载的上一份完整成果（没有则为 `{available:false}`），含 `runId`、`snapshotId`、`reports`、`bytes`、`sha256`、`createdAt`。`lastError` 只承载运行错误；清理失败单独汇总，仅当运行本身没有错误时出现在 `lastError`。 |
+| `GET /api/download` | 返回最近一次**完整**交付的 JSONL（`application/x-ndjson`），响应头含 `x-snapshot-id`、`x-delivery-run-id`、`x-delivery-reports`、`x-delivery-sha256`、`content-length`。首次完整交付前返回 `404 {"error":"no_delivery"}`。 |
 | `GET /api/health` | 健康检查。 |
 
 ### 快照一致性
@@ -123,13 +124,20 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
   state.json                     # 当前运行的进度（原子写）
   runs/<runId>.json              # 被新运行取代的旧运行归档
   snapshots/<snapshotId>/reports/<reportNo>.json   # 每个完整报告一个文件
-  deliveries/delivery-<snap>-<time>-<rand>.jsonl    # 不可变的交付文件
-  current-delivery.json          # 指向最近一次完整交付（原子替换）
+  deliveries/delivery-<snap>-<time>-<rand>.jsonl    # 不可变的交付文件（最多保留最近 3 份）
+  current-delivery.json          # 指向最近一次完整交付（原子替换，记录提交它的 runId）
 ```
 
 - 报告写盘使用临时文件 + `fsync` + `rename`，因此只会出现"完整报告"或"没有"。
 - 续跑时以磁盘上**完整且校验通过**的报告为真：不会重复请求，也覆盖了"写完报告但状态未落盘即被杀"的窗口。
+- **提交点与状态一致**：完成一次运行时的顺序是（1）写入并 fsync 不可变交付文件，（2）原子替换 `current-delivery.json`，（3）把运行状态写成 `complete`。指针里记录提交该成果的 `runId`，因此"成果切换"和"本次完成"以同一次原子替换为准：
+  - 若在（2）之后、（3）之前被杀，重启看到"指针指向本运行但状态仍为 running"，即判定本次**已提交**，直接补写 `complete`，不重新采集；
+  - 若在（2）之前被杀，指针仍指向上一份成果，本次运行保持 `interrupted`，续跑时从磁盘已有报告重新生成并提交，不会谎报成功；
+  - `progress.delivered` 由"指针 runId == 当前运行 runId"推导，重启前后含义不变。
 - 只有当本次运行的全部报告都成功时才生成交付并原子替换 `current-delivery.json`；失败运行不触碰上一份交付，进度为 `failed` 并逐条说明缺失/失败原因。
+- **下载读到的是同一份完整成果**：`GET /api/download` 先打开指针命名的不可变文件，再从该句柄流式输出；`content-length` / `x-delivery-*` 均取自这个已打开的文件（并与指针记录的字节数校验）。下载期间即使同时发布新成果、或清理删除了旧文件名，正在传输的客户端仍会读完自己那份完整快照；若打开瞬间文件恰好被替换，则改用新指针重试，不会产生 500。
+- 慢客户端只占用自己的响应流，不会阻塞其它下载或采集请求（无全局锁、逐请求独立句柄）。
+- **保留与清理**：每次提交后清理交付目录，保留最近 3 份（当前指针指向的文件永不删除）。清理在提交之后进行，失败不影响本次成果；无法删除的文件会记入进度错误，并留待下次清理重试。启动恢复时同样清理一次，并删除原子写中断留下的 `*.tmp`。
 - 收集期间下载接口读取"指针 → 不可变文件"，始终返回上一份完整成果；如果读取瞬间发生替换，会以新指针重读。
 
 ### 失败与恢复策略
@@ -138,7 +146,7 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 - 401 / 会话被封禁：重新 `GET /reports?snapshot=<固定快照>` 建立新会话，从该报告的**正文**重新开始，以便取得新的翻页凭证。
 - 连接被断开（response dropped）：nonce 与 token 已消耗，丢弃当前会话并重新进入同一快照，重取该报告。
 - 404（报告不可用）→ 记为 `missing`；HTML 无法解析/结构校验失败 → 记为 `failed`。两者都会让本次运行以 `failed` 结束，不发布交付，但其余成功报告已在磁盘上，下次续跑只需补齐缺失项。
-- 进程被 `SIGKILL`：`state.json` 中留下的 `running` 在下次启动时被识别为 `interrupted`，`POST /api/collect` 默认续跑（`resumedFrom` 记录它从哪次运行恢复）。
+- 进程被 `SIGKILL`：`state.json` 中留下的 `running` 在下次启动时被识别为 `interrupted`，`POST /api/collect` 默认续跑（`resumedFrom` 记录它从哪次运行恢复）。启动恢复会先对照交付指针判定上次是否已提交：指针属于该运行则补记为 `complete`，否则保持 `interrupted` 等待续跑。
 
 ## 输出格式（JSON Lines）
 
@@ -217,6 +225,9 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 | 快照隔离 | 采集中途发布新修订：本次成果完全来自旧快照；新会话可回到历史快照；`fresh` 运行切到新快照且只含新修订。下载始终返回上一份完整成果；失败运行不会覆盖它。 |
 | 布局变化 | 同一内容在 `classic` 与 `compact` 下解析结果逐项相等。 |
 | 进程重启 | 真实 `spawn` 采集器进程 → `SIGKILL` → 用同一数据目录重启 → 状态为 `interrupted` → 续跑完成；已落盘报告不再请求（按站点请求日志断言每份只取一次）；重启期间发布的新修订不混入；之后 `fresh` 运行进入新快照。 |
+| 成果提交一致性 | 模拟"报告全部落盘但指针尚未切换"的崩溃：重启为 `interrupted`、`delivered:false`、仍可下载上一份成果；续跑提交后 `delivered:true` 且不重复请求。模拟"指针已切换但完成状态未落盘"的崩溃：重启即判定 `complete`/`delivered:true`，下载与指针哈希一致。 |
+| 清理 | 连续 5 次完整提交后只保留最近 3 份交付且当前指针文件必留；构造无法删除的旧交付文件：本次运行仍为 `complete`、成果照常可下载，清理失败在进度中可见。 |
+| 并发下载 | 反复重采并触发清理时并行发起 24 个下载：无 500；每个响应的 `sha256`、`content-length`、`x-delivery-reports`、`x-snapshot-id` 与其实际字节和每条记录完全对应，无重复报告。 |
 
 测试进程启动的子进程由 esbuild 一次性打包（`packages: external`，仅打包本仓库源码），避免 tsx 冷启动拖慢计时；打包产物写入 `.tmp/`，不影响其它测试。
 

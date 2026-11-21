@@ -2,6 +2,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { pipeline } from "node:stream/promises";
 import type { ProgressSnapshot } from "../shared/types.js";
 import { Collector } from "./runner.js";
 
@@ -87,13 +88,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, collector: Coll
     }
 
     if (route === API.progress && req.method === "GET") {
-      const progress: ProgressSnapshot = collector.progress();
-      const pointer = await collector.storeRef.readDeliveryPointer();
+      // Read progress and the delivery pointer together so the reported run
+      // state and the committed delivery cannot disagree by an interleaving.
+      const [progress, pointer] = await Promise.all([
+        Promise.resolve(collector.progress()),
+        collector.storeRef.readDeliveryPointer(),
+      ]);
       sendJson(res, 200, {
         progress,
         delivery: pointer
           ? {
               available: true,
+              runId: pointer.runId,
               snapshotId: pointer.snapshotId,
               reports: pointer.reports,
               bytes: pointer.bytes,
@@ -156,38 +162,46 @@ async function handle(req: IncomingMessage, res: ServerResponse, collector: Coll
     }
 
     if (route === API.download && req.method === "GET") {
-      // Read the pointer, then the immutable file it names. If a publish
-      // rotates and prunes the file in between, retry with the newer pointer.
-      let pointer = await collector.storeRef.readDeliveryPointer();
-      if (!pointer) {
+      // Open the immutable file named by the pointer and stream from that exact
+      // handle. Headers are derived from the opened file, so they always
+      // describe the bytes actually served even if a publish or cleanup races
+      // with this request. A slow client only holds its own stream open; other
+      // requests are independent and are not delayed.
+      let opened: Awaited<ReturnType<Collector["storeRef"]["openDelivery"]>>;
+      try {
+        opened = await collector.storeRef.openDelivery();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          opened = null;
+        } else {
+          throw error;
+        }
+      }
+      if (!opened) {
         sendJson(res, 404, {
           error: "no_delivery",
           message: "尚无完整成果可供下载（首次完整交付尚未完成）。",
         });
         return;
       }
-      let body: Buffer;
-      try {
-        body = await collector.storeRef.readDelivery(pointer);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        pointer = await collector.storeRef.readDeliveryPointer();
-        if (!pointer) {
-          sendJson(res, 404, { error: "no_delivery", message: "尚无完整成果可供下载。" });
-          return;
-        }
-        body = await collector.storeRef.readDelivery(pointer);
-      }
+      const { pointer, handle, size } = opened;
       res.writeHead(200, {
         "content-type": "application/x-ndjson; charset=utf-8",
         "content-disposition": `attachment; filename="assay-${pointer.snapshotId}.jsonl"`,
-        "content-length": body.byteLength,
+        "content-length": size,
         "x-snapshot-id": pointer.snapshotId,
+        "x-delivery-run-id": pointer.runId,
         "x-delivery-sha256": pointer.sha256,
         "x-delivery-reports": String(pointer.reports),
         "cache-control": "no-store",
       });
-      res.end(body);
+      try {
+        await pipeline(handle.createReadStream(), res);
+      } catch (error) {
+        // The client went away or the response was destroyed; the delivery
+        // itself is untouched and remains available to the next request.
+        if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
+      }
       return;
     }
 

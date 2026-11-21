@@ -7,21 +7,25 @@ import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 import { after, describe, test } from "node:test";
 import { build as esbuild } from "esbuild";
 import { computeSignature, NONCE_HEADER, SESSION_HEADER, SIGNATURE_HEADER } from "../src/shared/protocol.js";
 import type { ReportRecord, Sample } from "../src/shared/types.js";
+import { CollectorStore } from "../src/collector/storage.js";
 import { MockAssaySite } from "../src/site/server.js";
 import {
   armFault,
   assertNoDuplicateReports,
   bodyRequestCounts,
+  deliveryFiles,
   download,
   getProgress,
   publish,
+  readDeliveryPointerFile,
+  readPersistedRun,
   readStoredReport,
   siteRequests,
   sleep,
@@ -30,6 +34,7 @@ import {
   startHarness,
   tempDataDir,
   waitForState,
+  writePersistedRun,
   type CollectorChild,
   type Harness,
 } from "./helpers.js";
@@ -324,8 +329,245 @@ describe("recovery", () => {
   });
 });
 
-describe("snapshots and layout", () => {
-  test("a revision published mid-collection does not mix into the pinned snapshot", async () => {
+describe("delivery commit, cleanup and concurrent downloads", () => {
+  test("cleanup keeps only the three newest deliveries and reports failures without breaking the run", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "classic" } });
+
+    // Five complete runs, each publishing one delivery.
+    for (let index = 0; index < 5; index++) {
+      await startCollect(h.service.url, h.site.url, { fresh: index > 0 });
+      const progress = await waitForState(h.service.url, ["complete", "failed"]);
+      assert.equal(progress.state, "complete", progress.lastError ?? "");
+      assert.equal(progress.delivered, true);
+      if (index < 4) await publish(h.site.url, { reportNos: [] });
+    }
+    await waitUntil(async () => (await deliveryFiles(h.dataDir)).length === 3, 5_000);
+    const kept = await deliveryFiles(h.dataDir);
+    assert.equal(kept.length, 3, `expected 3 retained deliveries, saw ${kept.join(", ")}`);
+    const pointer = await readDeliveryPointerFile(h.dataDir);
+    assert.ok(pointer);
+    assert.ok(kept.includes(pointer.file), "the current delivery must never be pruned");
+
+    // Failure injection: a prunable "delivery" that cannot be unlinked because
+    // it is a non-empty directory (with an old mtime so retention selects it).
+    // Cleanup must report the failure, keep the run complete, and keep serving
+    // the current delivery.
+    const stubborn = path.join(h.dataDir, "deliveries", "delivery-stubborn.jsonl");
+    await mkdir(stubborn, { recursive: true });
+    await writeFile(path.join(stubborn, "child"), "x");
+    const epoch = new Date(0);
+    await utimes(stubborn, epoch, epoch);
+    const newestSnapshot = await publish(h.site.url, { reportNos: [] });
+    await startCollect(h.service.url, h.site.url, { fresh: true });
+    const afterFailingCleanup = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(afterFailingCleanup.state, "complete", afterFailingCleanup.lastError ?? "");
+    assert.equal(afterFailingCleanup.delivered, true);
+    assert.equal(afterFailingCleanup.snapshotId, newestSnapshot.id);
+    // The run's own state is what matters most; a cleanup problem is surfaced
+    // only through progress.lastError when the run itself has nothing to say.
+    // Cleanup runs after the commit, so give it a moment to report.
+    await waitUntil(async () => /cleanup failed/.test((await getProgress(h.service.url)).progress.lastError ?? ""));
+    const stillServed = await download(h.service.url);
+    assert.equal(stillServed.status, 200);
+    assert.equal(stillServed.headers.get("x-snapshot-id"), afterFailingCleanup.snapshotId);
+    assert.notEqual(stillServed.headers.get("x-snapshot-id"), pointer.snapshotId);
+  });
+
+  test("a crash between report writes and the delivery commit is resumed without a false success", async () => {
+    const site = await MockAssaySite.start({ seedSnapshot: { layoutMode: "mixed" } });
+    cleanup.push(() => site.close());
+    const dataDir = await tempDataDir("crash-before-commit");
+    const port = await freePort();
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    // First complete run to have a delivery to protect.
+    await armFault(site.url, { type: "delay", matchPath: "/reports/R-", ms: 1 });
+    const entry = await buildCollectorEntry();
+    let launched = spawnCollector(entry, dataDir, port, site.url);
+    await launched.ready;
+    let child = launched.child;
+    await startCollect(baseUrl, site.url);
+    const first = await waitForState(baseUrl, ["complete", "failed"]);
+    assert.equal(first.state, "complete", first.lastError ?? "");
+    const firstDelivery = await download(baseUrl);
+    assert.equal(firstDelivery.status, 200);
+    const firstPointer = await readDeliveryPointerFile(dataDir);
+    assert.ok(firstPointer);
+
+    // Second run: all reports on disk, but the process dies before the commit.
+    await publish(site.url, { reportNos: ["R-0002"] });
+    await fetch(`${site.url}/__control/faults/clear`, { method: "POST" });
+    await startCollect(baseUrl, site.url, { fresh: true });
+    const second = await waitForState(baseUrl, ["complete", "failed"]);
+    assert.equal(second.state, "complete", second.lastError ?? "");
+    const secondPointer = await readDeliveryPointerFile(dataDir);
+    assert.ok(secondPointer && secondPointer.file !== firstPointer.file);
+
+    // Simulate "died before commit": run state is running, snapshot reports are
+    // complete, but the pointer still names the previous run. We restore the
+    // old pointer and rewind the state to running/interrupted.
+    const persisted = await readPersistedRun(dataDir);
+    assert.ok(persisted);
+    assert.equal(persisted.runId, secondPointer.runId);
+    await writeFile(
+      path.join(dataDir, "current-delivery.json"),
+      `${JSON.stringify(firstPointer, null, 2)}\n`,
+      "utf8",
+    );
+    await writePersistedRun(dataDir, {
+      ...persisted,
+      state: "running",
+      finishedAt: null,
+      deliveryFile: null,
+    });
+    child.kill("SIGKILL");
+    await waitForExit(child);
+    // While down, the old delivery is what a restart would find.
+    assert.equal((await readDeliveryPointerFile(dataDir))?.file, firstPointer.file);
+
+    launched = spawnCollector(entry, dataDir, port, site.url);
+    await launched.ready;
+    child = launched.child;
+    const interrupted = await getProgress(baseUrl);
+    assert.equal(interrupted.progress.state, "interrupted");
+    assert.equal(interrupted.progress.delivered, false, "an uncommitted run must not claim delivery");
+    assert.equal(interrupted.delivery.snapshotId, firstPointer.snapshotId);
+
+    // Resume: reports are trusted from disk, and the commit is performed now.
+    const resumed = await startCollect(baseUrl, site.url);
+    assert.equal(resumed.status, 202);
+    const finalProgress = await waitForState(baseUrl, ["complete", "failed"], 15_000);
+    assert.equal(finalProgress.state, "complete", finalProgress.lastError ?? "");
+    assert.equal(finalProgress.delivered, true);
+    assert.equal(finalProgress.snapshotId, second.snapshotId);
+    const finalPointer = await readDeliveryPointerFile(dataDir);
+    assert.equal(finalPointer?.runId, secondPointer.runId);
+    assert.notEqual(finalPointer?.file, firstPointer.file);
+    const finalDownload = await download(baseUrl);
+    assert.equal(finalDownload.status, 200);
+    assert.equal(finalDownload.headers.get("x-snapshot-id"), second.snapshotId);
+    // No report was fetched again: reports were already durable on disk.
+    const counts = bodyRequestCounts(await siteRequests(site.url));
+    assert.ok((counts.get("R-0002") ?? 0) <= 3, "resume must not re-crawl everything");
+
+    child.kill("SIGTERM");
+    await waitForExit(child);
+  });
+
+  test("a crash right after the pointer swap is recognized as committed on restart", async () => {
+    const site = await MockAssaySite.start({ seedSnapshot: { layoutMode: "classic" } });
+    cleanup.push(() => site.close());
+    const dataDir = await tempDataDir("crash-after-commit");
+    const port = await freePort();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const entry = await buildCollectorEntry();
+    let launched = spawnCollector(entry, dataDir, port, site.url);
+    await launched.ready;
+    let child = launched.child;
+
+    await startCollect(baseUrl, site.url);
+    const done = await waitForState(baseUrl, ["complete", "failed"]);
+    assert.equal(done.state, "complete", done.lastError ?? "");
+    const pointer = await readDeliveryPointerFile(dataDir);
+    assert.ok(pointer);
+    const persisted = await readPersistedRun(dataDir);
+    assert.ok(persisted);
+    child.kill("SIGKILL");
+    await waitForExit(child);
+
+    // Simulate the crash window: the pointer was swapped but the complete
+    // state write never landed.
+    await writePersistedRun(dataDir, {
+      ...persisted,
+      state: "running",
+      finishedAt: null,
+      deliveryFile: null,
+    });
+
+    launched = spawnCollector(entry, dataDir, port, site.url);
+    await launched.ready;
+    child = launched.child;
+    const recovered = await getProgress(baseUrl);
+    assert.equal(recovered.progress.state, "complete", "pointer proves the commit happened");
+    assert.equal(recovered.progress.delivered, true);
+    assert.equal(recovered.progress.snapshotId, pointer.snapshotId);
+    const reloaded = await readPersistedRun(dataDir);
+    assert.equal(reloaded?.state, "complete");
+    assert.equal(reloaded?.deliveryFile, pointer.file);
+
+    // Nothing is refetched and the committed delivery is served byte-for-byte.
+    const served = await download(baseUrl);
+    assert.equal(served.status, 200);
+    assert.equal(served.headers.get("x-delivery-sha256"), pointer.sha256);
+    assert.equal(createHash("sha256").update(served.raw).digest("hex"), pointer.sha256);
+    assert.equal(served.records.length, 6);
+    // Starting `/api/collect` again after the recovered commit must not need to
+    // crawl the site again: every report is already durable on disk.
+    const again = await startCollect(baseUrl, site.url);
+    assert.equal(again.status, 202);
+    const stillCommitted = await waitForState(baseUrl, ["complete", "failed"]);
+    assert.equal(stillCommitted.state, "complete", stillCommitted.lastError ?? "");
+    assert.equal(stillCommitted.delivered, true);
+    assert.equal((await bodyRequestCounts(await siteRequests(site.url))).size, 6);
+    assert.ok(
+      [...(await bodyRequestCounts(await siteRequests(site.url))).values()].every((count) => count === 1),
+      "no report body may be requested twice",
+    );
+
+    child.kill("SIGTERM");
+    await waitForExit(child);
+  });
+
+  test("concurrent downloads during repeated re-collection always match their own headers", async () => {
+    const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
+
+    // Build up several deliveries so cleanup is actively pruning the 3-file
+    // retention window while the downloads below race it.
+    for (let index = 0; index < 4; index++) {
+      await startCollect(h.service.url, h.site.url, { fresh: index > 0 });
+      const progress = await waitForState(h.service.url, ["complete", "failed"]);
+      assert.equal(progress.state, "complete", progress.lastError ?? "");
+      await publish(h.site.url, { reportNos: [] });
+    }
+
+    // Hold a run open while launching many parallel downloads. Every response
+    // must carry headers that describe exactly the bytes it delivered, and no
+    // request may fail with a 500 because cleanup removed a file underneath it.
+    await armFault(h.site.url, { type: "delay", matchPath: "/reports/R-0001", ms: 200, times: 1 });
+    const running = await startCollect(h.service.url, h.site.url, { fresh: true });
+    assert.equal(running.status, 202);
+
+    const attempts = Array.from({ length: 24 }, async () => {
+      const response = await fetch(`${h.service.url}/api/download`);
+      const raw = await response.text();
+      return { status: response.status, raw, headers: response.headers };
+    });
+    const results = await Promise.all(attempts);
+    for (const result of results) {
+      assert.equal(result.status, 200, "download must not 500 while cleanup runs");
+      assert.equal(
+        createHash("sha256").update(result.raw).digest("hex"),
+        result.headers.get("x-delivery-sha256"),
+        "sha256 header must match the served body",
+      );
+      assert.equal(Number(result.headers.get("content-length")), Buffer.byteLength(result.raw));
+      assert.equal(Number(result.headers.get("x-delivery-reports")), 6);
+      const records = result.raw.trim().split("\n").map((line) => JSON.parse(line) as ReportRecord);
+      assert.equal(records.length, 6);
+      const headerSnapshot = result.headers.get("x-snapshot-id");
+      for (const record of records) {
+        assert.equal(record.snapshotId, headerSnapshot, "all records must belong to the header snapshot");
+      }
+      assertNoDuplicateReports(records);
+    }
+
+    const finished = await waitForState(h.service.url, ["complete", "failed"]);
+    assert.equal(finished.state, "complete", finished.lastError ?? "");
+    assert.ok((await deliveryFiles(h.dataDir)).length <= 3);
+  });
+});
+
+describe("snapshots and layout", () => {  test("a revision published mid-collection does not mix into the pinned snapshot", async () => {
     const h = await harness({ seedSnapshot: { layoutMode: "mixed" } });
     // Slow down a later report so the publication lands mid-run.
     await armFault(h.site.url, { type: "delay", matchPath: "/reports/R-0005", ms: 250, times: 2 });

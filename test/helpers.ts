@@ -1,7 +1,7 @@
 /** Test helpers: real local HTTP services and delivery parsing. */
 
 import type { ChildProcessByStdio } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import type { Readable } from "node:stream";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -147,6 +147,67 @@ export async function storedReportFiles(dataDir: string, snapshotId: string): Pr
   } catch {
     return [];
   }
+}
+
+/** All regular delivery files currently on disk (directories excluded). */
+export async function deliveryFiles(dataDir: string): Promise<string[]> {
+  const dir = path.join(dataDir, "deliveries");
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const files: string[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".jsonl")) continue;
+    const stat = await statSafe(path.join(dir, name));
+    if (stat?.isFile()) files.push(name);
+  }
+  return files.sort();
+}
+
+async function statSafe(filePath: string): Promise<import("node:fs").Stats | null> {
+  try {
+    return await stat(filePath);
+  } catch {
+    return null;
+  }
+}
+
+export async function readPersistedRun(dataDir: string): Promise<
+  | {
+      runId: string;
+      state: string;
+      snapshotId: string;
+      deliveryFile: string | null;
+      entries: Array<{ reportNo: string; revision: number; status: string; sampleCount?: number }>;
+    }
+  | null
+> {
+  try {
+    return JSON.parse(await readFile(path.join(dataDir, "state.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+export async function writePersistedRun(dataDir: string, run: unknown): Promise<void> {
+  await writeFile(path.join(dataDir, "state.json"), `${JSON.stringify(run, null, 2)}\n`, "utf8");
+}
+
+export async function readDeliveryPointerFile(
+  dataDir: string,
+): Promise<{ runId: string; file: string; snapshotId: string; reports: number; bytes: number; sha256: string } | null> {
+  try {
+    return JSON.parse(await readFile(path.join(dataDir, "current-delivery.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+export async function removeFile(filePath: string): Promise<void> {
+  await rm(filePath, { force: true });
 }
 
 export async function readStoredReport(
