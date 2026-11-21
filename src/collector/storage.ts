@@ -40,6 +40,22 @@ export interface DeliveryPointer {
   createdAt: string;
 }
 
+/**
+ * A durably confirmed report page. The body is page 0; appendix pages keep the
+ * number shown in their URL. Each fragment is written atomically with fsync,
+ * so a killed process resumes with every page that was fully acknowledged.
+ */
+export interface PageFragment {
+  reportNo: string;
+  revision: number;
+  snapshotId: string;
+  /** 0 for the report body, 1..N for appendix pages. */
+  page: number;
+  url: string;
+  html: string;
+  savedAt: string;
+}
+
 const RUN_STATE = "state.json";
 const DELIVERY_POINTER = "current-delivery.json";
 const TMP_SUFFIX = ".tmp";
@@ -117,6 +133,64 @@ export class CollectorStore {
       if (!sample.sampleId || !Array.isArray(sample.items) || sample.items.length === 0) return null;
     }
     return record;
+  }
+
+  private checkpointDir(snapshotId: string, reportNo: string): string {
+    return path.join(this.snapshotDir(snapshotId), "checkpoints", reportNo);
+  }
+
+  private fragmentFile(snapshotId: string, reportNo: string, page: number): string {
+    return path.join(this.checkpointDir(snapshotId, reportNo), `page-${String(page).padStart(4, "0")}.json`);
+  }
+
+  /** Persist one confirmed page (atomic temp + fsync + rename). */
+  async writePageFragment(snapshotId: string, fragment: PageFragment): Promise<void> {
+    await writeFileAtomic(
+      this.fragmentFile(snapshotId, fragment.reportNo, fragment.page),
+      `${JSON.stringify(fragment)}\n`,
+    );
+  }
+
+  /**
+   * Load all fragments for a report in page order, keeping only fragments whose
+   * snapshot/revision still match the run. A missing directory simply means no
+   * page has been confirmed yet.
+   */
+  async readPageFragments(
+    snapshotId: string,
+    reportNo: string,
+    revision: number,
+  ): Promise<PageFragment[]> {
+    const dir = this.checkpointDir(snapshotId, reportNo);
+    let names: string[];
+    try {
+      names = (await fs.readdir(dir)).filter((name) => /^page-\d+\.json$/.test(name)).sort();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const fragments: PageFragment[] = [];
+    for (const name of names) {
+      const fragment = await readJson<PageFragment>(path.join(dir, name));
+      if (
+        !fragment ||
+        fragment.snapshotId !== snapshotId ||
+        fragment.reportNo !== reportNo ||
+        fragment.revision !== revision ||
+        typeof fragment.html !== "string" ||
+        typeof fragment.url !== "string"
+      ) {
+        continue;
+      }
+      fragments.push(fragment);
+    }
+    return fragments.sort((a, b) => a.page - b.page);
+  }
+
+  /** Remove all page checkpoints once the merged report record is published. */
+  async clearPageFragments(snapshotId: string, reportNo: string): Promise<void> {
+    const dir = this.checkpointDir(snapshotId, reportNo);
+    await fs.rm(dir, { recursive: true, force: true });
   }
 
   /**

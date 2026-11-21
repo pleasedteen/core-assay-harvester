@@ -239,12 +239,19 @@ export class SignedClient {
         });
       } catch (error) {
         // A dropped connection is ambiguous: the server may have accepted and
-        // consumed the nonce. Reconnect before retrying.
-        lastError = new SessionLostError(`Connection dropped for ${targetPath}: ${describe(error)}`, error);
+        // consumed the nonce (and, on an appendix page, the one-time token).
+        const dropped = new SessionLostError(
+          `Connection dropped for ${targetPath}: ${describe(error)}`,
+          error,
+        );
         this.sessionId = null;
         this.nonce = null;
+        // A token-bearing appendix URL cannot be retried in a new session:
+        // its token was bound to the dead one. Surface immediately so the
+        // runner re-enters through the body for a fresh, single-use token.
+        if (target.searchParams.has("token")) throw dropped;
         reconnects += 1;
-        if (reconnects > 3) throw lastError;
+        if (reconnects > 3) throw dropped;
         await this.sleep(backoff(attempt));
         continue;
       }
@@ -255,11 +262,16 @@ export class SignedClient {
       } catch (error) {
         // The response started but the body was cut off. The server has
         // already rotated the nonce, so the current session cannot continue.
-        lastError = new SessionLostError(`Response body interrupted for ${targetPath}: ${describe(error)}`, error);
+        const interrupted = new SessionLostError(
+          `Response body interrupted for ${targetPath}: ${describe(error)}`,
+          error,
+        );
         this.sessionId = null;
         this.nonce = null;
+        // Same rule as a socket drop: never silently replay a used token.
+        if (target.searchParams.has("token")) throw interrupted;
         reconnects += 1;
-        if (reconnects > 3) throw lastError;
+        if (reconnects > 3) throw interrupted;
         await this.sleep(backoff(attempt));
         continue;
       }

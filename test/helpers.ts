@@ -186,3 +186,35 @@ export function bodyRequestCounts(
   }
   return counts;
 }
+
+/** Count appendix page requests per report number (any page, any session). */
+export function appendixRequestCounts(
+  requests: Array<{ note: string; url: string; status: number }>,
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const request of requests) {
+    if (!/^appendix_/.test(request.note)) continue;
+    const match = /^\/reports\/([^/]+)\/appendix\//.exec(request.url.split("?")[0] ?? "");
+    if (!match) continue;
+    const reportNo = decodeURIComponent(match[1]!);
+    counts.set(reportNo, (counts.get(reportNo) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/** Count requests for a specific appendix page of a report. */
+export function appendixPageRequestCounts(
+  requests: Array<{ note: string; url: string }>,
+  reportNo: string,
+): Map<number, number> {
+  const counts = new Map<number, number>();
+  const prefix = `/reports/${reportNo}/appendix/`;
+  for (const request of requests) {
+    const path = request.url.split("?")[0] ?? "";
+    if (!path.startsWith(prefix)) continue;
+    const page = Number(path.slice(prefix.length));
+    if (!Number.isInteger(page)) continue;
+    counts.set(page, (counts.get(page) ?? 0) + 1);
+  }
+  return counts;
+}

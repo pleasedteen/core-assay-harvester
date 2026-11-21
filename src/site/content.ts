@@ -33,6 +33,12 @@ export interface ReportSeed {
 
 export const REPORT_NOS = ["R-0001", "R-0002", "R-0003", "R-0004", "R-0005", "R-0006"] as const;
 
+/** Report whose sample count can be expanded into a very long appendix. */
+export const LONG_REPORT_NO = "R-0006";
+
+/** Default sample counts per report (2 body samples, the rest one-per-appendix-page). */
+const DEFAULT_SAMPLE_COUNTS = [4, 3, 2, 4, 3, 5];
+
 const LITHOLOGIES = ["砂岩", "粉砂岩", "泥岩", "灰岩", "花岗岩", "砾岩"];
 
 function mulberry32(seed: number): () => number {
@@ -124,12 +130,20 @@ function buildItems(
   return items;
 }
 
-export function buildReport(reportNo: string, revision: number): ReportSeed {
+export function buildReport(
+  reportNo: string,
+  revision: number,
+  sampleCountOverride?: number,
+): ReportSeed {
   const reportIndex = REPORT_NOS.indexOf(reportNo as (typeof REPORT_NOS)[number]);
   if (reportIndex < 0) throw new Error(`Unknown report ${reportNo}`);
   const rng = mulberry32(hashString(`${reportNo}@${revision}`));
   // 2 samples => body only (no appendix); 5 samples => three appendix pages.
-  const sampleCount = [4, 3, 2, 4, 3, 5][reportIndex]!;
+  // The long-report seed expands one report past the legacy 50-appendix-page
+  // threshold; the first two samples always remain on the body page.
+  const override =
+    sampleCountOverride !== undefined && reportNo === LONG_REPORT_NO ? sampleCountOverride : undefined;
+  const sampleCount = Math.max(2, override ?? DEFAULT_SAMPLE_COUNTS[reportIndex]!);
   const samples: SampleSeed[] = [];
   for (let i = 0; i < sampleCount; i++) {
     const from = 3 + i * 1.6 + rng() * 0.4;

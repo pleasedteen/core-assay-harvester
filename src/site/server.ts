@@ -14,7 +14,7 @@ import {
   computeSignature,
 } from "../shared/protocol.js";
 import type { Layout } from "../shared/types.js";
-import { REPORT_NOS, buildReport, type ReportSeed } from "./content.js";
+import { LONG_REPORT_NO, REPORT_NOS, buildReport, type ReportSeed } from "./content.js";
 import {
   appendixPageCount,
   renderAppendixPage,
@@ -87,6 +87,11 @@ export interface SiteOptions {
   port?: number;
   host?: string;
   seedSnapshot?: { layoutMode?: LayoutMode; revisions?: Record<string, number> };
+  /**
+   * Expand the long report (R-0006) to this many samples so its appendix runs
+   * past the legacy 50-page limit. The first two samples stay on the body.
+   */
+  longReportSamples?: number;
 }
 
 export interface SiteHandle {
@@ -117,8 +122,11 @@ export class MockAssaySite {
   private signedCounter = 0;
   private readonly corruptedReports = new Map<string, number>();
   private readonly unavailableReports = new Map<string, number>();
+  /** Sample count override for the long report; undefined keeps the seed default. */
+  private readonly longReportSamples: number | undefined;
 
-  private constructor(seed?: SiteOptions["seedSnapshot"]) {
+  private constructor(seed?: SiteOptions["seedSnapshot"], longReportSamples?: number) {
+    this.longReportSamples = longReportSamples;
     const layoutMode = seed?.layoutMode ?? "mixed";
     const revisions: Record<string, number> = {};
     for (const reportNo of REPORT_NOS) revisions[reportNo] = seed?.revisions?.[reportNo] ?? 1;
@@ -137,7 +145,7 @@ export class MockAssaySite {
   }
 
   static async start(options: SiteOptions = {}): Promise<SiteHandle> {
-    const site = new MockAssaySite(options.seedSnapshot);
+    const site = new MockAssaySite(options.seedSnapshot, options.longReportSamples);
     const host = options.host ?? "127.0.0.1";
     const port = options.port ?? 0;
     await new Promise<void>((resolve, reject) => {
@@ -202,9 +210,7 @@ export class MockAssaySite {
     const url = new URL(req.url ?? "/", "http://site.local");
     const path = url.pathname;
     try {
-      const delayFault = this.faults.find(
-        (fault) => fault.type === "delay" && (!fault.matchPath || path.includes(fault.matchPath)),
-      );
+      const delayFault = this.mostSpecificFault(path, "delay");
       if (delayFault) {
         delayFault.remaining = (delayFault.remaining ?? 1) - 1;
         if (delayFault.remaining <= 0) this.faults.splice(this.faults.indexOf(delayFault), 1);
@@ -411,14 +417,27 @@ export class MockAssaySite {
     }, 5);
   }
 
+  /** Most specific matching fault of a given type (or any non-corrupt fault). */
+  private mostSpecificFault(pathname: string, type?: FaultType): Fault | null {
+    let best: Fault | null = null;
+    for (const candidate of this.faults) {
+      if (candidate.type === "corruptReport") continue;
+      if (type && candidate.type !== type) continue;
+      if (candidate.matchPath && !pathname.includes(candidate.matchPath)) continue;
+      if (!best || (candidate.matchPath ?? "").length > (best.matchPath ?? "").length) {
+        best = candidate;
+      }
+    }
+    return best;
+  }
+
   private takeFault(pathname: string): Fault | null {
-    const index = this.faults.findIndex(
-      (fault) => fault.type !== "corruptReport" && (!fault.matchPath || pathname.includes(fault.matchPath)),
-    );
-    if (index < 0) return null;
-    const fault = this.faults[index]!;
+    // Pick the most specific matching fault so, for example, a drop targeted
+    // at one appendix page is not shadowed by a broad delay on "/appendix/".
+    const fault = this.mostSpecificFault(pathname);
+    if (!fault) return null;
     fault.remaining = (fault.remaining ?? 1) - 1;
-    if (fault.remaining <= 0) this.faults.splice(index, 1);
+    if (fault.remaining <= 0) this.faults.splice(this.faults.indexOf(fault), 1);
     return fault;
   }
 
@@ -465,14 +484,42 @@ export class MockAssaySite {
       return;
     }
 
-    const report = buildReport(reportNo, revision);
+    const report = this.buildSeedReport(reportNo, revision);
     const pages = splitPages(report);
     const bodySamples = pages[0]!;
+    const appendixTotal = appendixPageCount(report);
     const token = this.issueToken(session, reportNo, 1);
     const appendixHref =
       pages.length > 1 ? `/reports/${encodeURIComponent(reportNo)}/appendix/1?token=${token.token}` : null;
+
+    // Re-entry support for resumable crawls: a replacement session may ask the
+    // body for a fresh, single-use token pointing at its first unconfirmed
+    // appendix page instead of re-walking every page already delivered.
+    let resumeHref: string | null = null;
+    const resumeParam = url.searchParams.get("resumePage");
+    if (resumeParam !== null) {
+      const resumePage = Number(resumeParam);
+      if (!Number.isInteger(resumePage) || resumePage < 1) {
+        this.sendJson(
+          res,
+          400,
+          { error: "bad_resume_page", message: "resumePage must be a positive appendix page number." },
+          { [SNAPSHOT_HEADER]: snapshot.id, [NONCE_HEADER]: session.nonce },
+        );
+        this.log({ method: "GET", url: req.url ?? "", status: 400, sessionId: session.id, snapshotId: snapshot.id, note: "bad_resume_page" });
+        return;
+      }
+      if (resumePage <= appendixTotal) {
+        const resumeToken = this.issueToken(session, reportNo, resumePage);
+        resumeHref =
+          `/reports/${encodeURIComponent(reportNo)}/appendix/${resumePage}?token=${resumeToken.token}`;
+      }
+      // resumePage beyond the last appendix simply means every page is
+      // already delivered: the body responds without a resume link.
+    }
+
     const html = this.renderForSnapshot(snapshot, report, (layoutReport) =>
-      renderBodyPage(layoutReport, snapshot.id, bodySamples, appendixHref),
+      renderBodyPage(layoutReport, snapshot.id, bodySamples, appendixHref, resumeHref),
     );
     if (auth.dropResponse) {
       this.dropResponse(req, res, session, snapshot);
@@ -539,7 +586,7 @@ export class MockAssaySite {
       return;
     }
 
-    const report = buildReport(reportNo, revision);
+    const report = this.buildSeedReport(reportNo, revision);
     const pages = splitPages(report);
     const pageSamples = pages[page];
     if (page < 1 || page > appendixPageCount(report) || !pageSamples) {
@@ -566,6 +613,14 @@ export class MockAssaySite {
     }
     this.log({ method: "GET", url: req.url ?? "", status: 200, sessionId: session.id, snapshotId: snapshot.id, note: `appendix_${page}` });
     this.respondHtml(res, html, session, snapshot);
+  }
+
+  private buildSeedReport(reportNo: string, revision: number): ReportSeed {
+    return buildReport(
+      reportNo,
+      revision,
+      reportNo === LONG_REPORT_NO ? this.longReportSamples : undefined,
+    );
   }
 
   private renderForSnapshot(

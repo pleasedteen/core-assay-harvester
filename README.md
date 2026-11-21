@@ -5,6 +5,7 @@
 - 站点与采集器都是真实 HTTP 服务，签名、一次性翻页凭证、限流、封禁会话、响应中断都在服务端真实校验/注入。
 - 站点是纯本地、确定性内容生成器（固定种子），不访问任何外网，也不依赖时间或随机数来决定报告内容。
 - 采集结果以快照为单位物化，进程被杀后可用同一数据目录继续，已完整落盘的报告不会再请求。
+- 长报告（超过 50 页附表）同样支持：每个页面确认后立即 fsync 落盘，断线换会话或进程重启后只请求尚未确认落盘的页面，翻页凭证始终限当前会话一次性使用。
 - 下载接口在采集和恢复期间始终返回上一份完整成果；首次完整交付前明确返回"尚无成果"。
 - `npm test` 用真实本地 HTTP 交互覆盖正常采集、会话恢复、响应中断、布局变化、进程重启，通常在 20–40 秒内结束。
 
@@ -42,7 +43,7 @@ curl -s -D - -o result.jsonl http://127.0.0.1:4200/api/download
 node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").forEach(l=>console.log(JSON.parse(l).reportNo))'
 ```
 
-环境变量：站点 `SITE_PORT`、`SITE_HOST`、`SITE_LAYOUT=mixed|classic|compact`；采集器 `COLLECTOR_PORT`、`COLLECTOR_HOST`、`COLLECTOR_DATA_DIR`（默认 `data/collector`）、`SITE_URL`（默认 `http://127.0.0.1:4100`）。
+环境变量：站点 `SITE_PORT`、`SITE_HOST`、`SITE_LAYOUT=mixed|classic|compact`、`SITE_LONG_REPORT_SAMPLES`（把 R-0006 扩展为长报告，如 `54` 表示正文 2 样本 + 52 页附表）；采集器 `COLLECTOR_PORT`、`COLLECTOR_HOST`、`COLLECTOR_DATA_DIR`（默认 `data/collector`）、`SITE_URL`（默认 `http://127.0.0.1:4100`）。
 
 ## 模拟站点设计
 
@@ -52,6 +53,7 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 | --- | --- |
 | `GET /reports` | 报告目录。每行有报告编号、修订号、发布日期，链接到正文。这是唯一无需签名的入口，同时下发会话与签名材料。`?snapshot=snap-0001` 可重新进入历史快照。 |
 | `GET /reports/:reportNo` | 报告正文（前 2 个样本），含编号、修订、发布日期与化验表。 |
+| `GET /reports/:reportNo?resumePage=N` | 续抓入口：在正文中额外下发一个指向附表第 N 页的一次性 token 链接（`data-role="appendix-resume"`）。token 仍绑定当前会话且只能用一次，供换会话/重启后跳过已确认页面。`N` 超过最后一页时正文不含续抓链接。 |
 | `GET /reports/:reportNo/appendix/:page?token=...` | 附表页（每页 1 个样本）。**后续入口只能从页面内容发现**：正文中的附表链接，附表页中的"下一附表"链接。 |
 
 两种 HTML 布局（同一快照内可混合；`/__control/publish` 可整体切换）：
@@ -99,6 +101,8 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 
 无论响应是否成功送达（包括被注入的断连），token 都视为已消耗——这正是"已接受翻页请求但响应送达前断开"的场景：客户端必须重新进入会话并从正文重新发现入口，才能拿到新 token。
 
+**长报告的页级续抓**：正文支持 `?resumePage=N`，返回一个绑定当前会话、指向第 N 页的一次性 token 链接（仍从页面 HTML 中发现，不允许客户端自行构造翻页 URL）。续抓 token 与普通翻页 token 走完全相同的校验（重放 409、跨会话 403、页码不匹配 403），因此翻页凭证始终限当前会话使用一次。采集器在断线换会话或重启后，用它直接跳到第一个尚未确认落盘的页面，已确认页面不再请求。
+
 ## 采集服务设计
 
 ### HTTP 接口
@@ -123,22 +127,25 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
   state.json                     # 当前运行的进度（原子写）
   runs/<runId>.json              # 被新运行取代的旧运行归档
   snapshots/<snapshotId>/reports/<reportNo>.json   # 每个完整报告一个文件
+  snapshots/<snapshotId>/checkpoints/<reportNo>/page-NNNN.json  # 逐页确认片段（正文=0000）
   deliveries/delivery-<snap>-<time>-<rand>.jsonl    # 不可变的交付文件
   current-delivery.json          # 指向最近一次完整交付（原子替换）
 ```
 
 - 报告写盘使用临时文件 + `fsync` + `rename`，因此只会出现"完整报告"或"没有"。
-- 续跑时以磁盘上**完整且校验通过**的报告为真：不会重复请求，也覆盖了"写完报告但状态未落盘即被杀"的窗口。
-- 只有当本次运行的全部报告都成功时才生成交付并原子替换 `current-delivery.json`；失败运行不触碰上一份交付，进度为 `failed` 并逐条说明缺失/失败原因。
+- 每个页面（正文 + 每一页附表）解析通过后立即以同样的原子方式写入 `checkpoints/` 片段；片段必须构成从正文开始的连续前缀，否则视为不可用并从正文重抓。
+- 续跑时以磁盘上**完整且校验通过**的报告为真：不会重复请求，也覆盖了"写完报告但状态未落盘即被杀"的窗口。报告未完成时，则以 checkpoint 前缀为真，只请求尚未确认的页面。
+- 报告合并写盘后删除其 checkpoint 目录。
+- 只有当本次运行的全部报告都成功时才生成交付并原子替换 `current-delivery.json`；失败运行不触碰上一份交付，进度为 `failed` 并逐条说明缺失/失败原因。即使站点已发布新修订，也必须先交齐原快照才会替换下载。
 - 收集期间下载接口读取"指针 → 不可变文件"，始终返回上一份完整成果；如果读取瞬间发生替换，会以新指针重读。
 
 ### 失败与恢复策略
 
 - 429：按 `x-retry-after-ms` 等待后重试（nonce 未被消耗）。
-- 401 / 会话被封禁：重新 `GET /reports?snapshot=<固定快照>` 建立新会话，从该报告的**正文**重新开始，以便取得新的翻页凭证。
-- 连接被断开（response dropped）：nonce 与 token 已消耗，丢弃当前会话并重新进入同一快照，重取该报告。
-- 404（报告不可用）→ 记为 `missing`；HTML 无法解析/结构校验失败 → 记为 `failed`。两者都会让本次运行以 `failed` 结束，不发布交付，但其余成功报告已在磁盘上，下次续跑只需补齐缺失项。
-- 进程被 `SIGKILL`：`state.json` 中留下的 `running` 在下次启动时被识别为 `interrupted`，`POST /api/collect` 默认续跑（`resumedFrom` 记录它从哪次运行恢复）。
+- 401 / 会话被封禁：重新 `GET /reports?snapshot=<固定快照>` 建立新会话，再从该报告正文以 `?resumePage=<首个未确认页>` 取得新的一次性凭证，已确认落盘的页面不重抓。
+- 连接被断开（response dropped）：nonce 与 token 已消耗，丢弃当前会话并重新进入同一快照；带 token 的附表 URL 绝不在新会话中重放，而是经正文续抓入口换新 token，从首个未确认页继续。
+- 404（报告不可用）→ 记为 `missing`；HTML 无法解析/结构校验失败 → 记为 `failed`。两者都会让本次运行以 `failed` 结束，不发布交付，但其余成功报告与已确认页面已在磁盘上，下次续跑只需补齐缺失项。
+- 进程被 `SIGKILL`：`state.json` 中留下的 `running` 在下次启动时被识别为 `interrupted`，`POST /api/collect` 默认续跑（`resumedFrom` 记录它从哪次运行恢复）；续跑只请求 checkpoint 中尚未确认的页面。
 
 ## 输出格式（JSON Lines）
 
@@ -217,6 +224,7 @@ node -e 'require("fs").readFileSync("result.jsonl","utf8").trim().split("\n").fo
 | 快照隔离 | 采集中途发布新修订：本次成果完全来自旧快照；新会话可回到历史快照；`fresh` 运行切到新快照且只含新修订。下载始终返回上一份完整成果；失败运行不会覆盖它。 |
 | 布局变化 | 同一内容在 `classic` 与 `compact` 下解析结果逐项相等。 |
 | 进程重启 | 真实 `spawn` 采集器进程 → `SIGKILL` → 用同一数据目录重启 → 状态为 `interrupted` → 续跑完成；已落盘报告不再请求（按站点请求日志断言每份只取一次）；重启期间发布的新修订不混入；之后 `fresh` 运行进入新快照。 |
+| 超长附表（>50 页） | 54 样本（52 页附表）端到端采集；每页恰好请求一次；末段（第 50 页）注入断连：仅该页重取一次、已确认页不重抓、经正文 `resumePage` 换新会话一次性 token、无 token 重放；末段注入 `SIGKILL`：重启后只请求未确认页面、交齐原快照后才替换下载、checkpoint 清理。 |
 
 测试进程启动的子进程由 esbuild 一次性打包（`packages: external`，仅打包本仓库源码），避免 tsx 冷启动拖慢计时；打包产物写入 `.tmp/`，不影响其它测试。
 

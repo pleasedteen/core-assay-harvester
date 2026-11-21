@@ -28,6 +28,8 @@ export interface ParsedPage {
   /** Absolute-or-relative URLs discovered in page content. */
   appendixLinks: string[];
   nextLink: string | null;
+  /** Body-only: a re-entry token link to the first unconfirmed appendix page. */
+  resumeLink: string | null;
 }
 
 const MISSING_TOKENS = new Set(["", "—", "–", "-", "/", "n/a", "na", "缺测", "未测", "…", "...", "null"]);
@@ -248,14 +250,25 @@ function findTables($: CheerioAPI): Cheerio<AnyNode>[] {
 function discoverLinks($: CheerioAPI, pageKind: "body" | "appendix"): {
   appendixLinks: string[];
   nextLink: string | null;
+  resumeLink: string | null;
 } {
   const appendixLinks: string[] = [];
   const seen = new Set<string>();
+
+  // A body page may carry a re-entry link for a replacement session. It is
+  // discovered from page content like every other paging entry, but kept
+  // separate so normal pagination never jumps through it.
+  let resumeLink: string | null = null;
 
   $("a").each((_index, anchor) => {
     const href = $(anchor).attr("href");
     if (!href) return;
     const role = $(anchor).attr("data-role") ?? "";
+    const isResume = role === "appendix-resume" || $(anchor).hasClass("appendix-resume-link");
+    if (isResume) {
+      if (!resumeLink) resumeLink = href;
+      return;
+    }
     const isAppendixLink =
       /\/appendix\//.test(href) ||
       role === "appendix" ||
@@ -278,7 +291,7 @@ function discoverLinks($: CheerioAPI, pageKind: "body" | "appendix"): {
     const explicit = $("a.next-page, a[rel=next], a[data-role=next]").first().attr("href");
     nextLink = explicit ?? appendixLinks.find((href) => !/\/appendix\/1(?:[?#]|$)/.test(href)) ?? null;
   }
-  return { appendixLinks, nextLink };
+  return { appendixLinks, nextLink, resumeLink };
 }
 
 export interface ParseContext {
@@ -353,7 +366,7 @@ export function parsePage(html: string, context: ParseContext = {}): ParsedPage 
   const publishedAt =
     normalizeSpace($('[data-field="publishedAt"]').first().text()) || new Date(0).toISOString();
 
-  const { appendixLinks, nextLink } = discoverLinks($, pageKind);
+  const { appendixLinks, nextLink, resumeLink } = discoverLinks($, pageKind);
   return {
     reportNo,
     revision,
@@ -367,6 +380,7 @@ export function parsePage(html: string, context: ParseContext = {}): ParsedPage 
     sourceUrl,
     appendixLinks,
     nextLink,
+    resumeLink: pageKind === "body" ? resumeLink : null,
   };
 }
 

@@ -188,6 +188,7 @@ export function renderBodyPage(
   snapshotId: string,
   samples: SampleSeed[],
   appendixHref: string | null,
+  resumeHref: string | null = null,
 ): string {
   const table = report.layout === "classic" ? classicTable(report, samples, 1) : compactTable(samples, 1);
   let links = "";
@@ -197,10 +198,20 @@ export function renderBodyPage(
         ? `<div class="appendix-links"><h2>附表</h2><ul><li><a class="appendix" href="${esc(appendixHref)}">附表 1：续样本检测结果</a></li></ul></div>`
         : `<nav class="subdocs"><a data-role="appendix" href="${esc(appendixHref)}">附表 1：续样本检测结果</a></nav>`;
   }
+  // A re-entry link issued for a replacement session: the entry still comes
+  // from page content and its token is bound to the current session and only
+  // valid once, but it points at the first not-yet-delivered appendix page so
+  // confirmed pages are never requested again.
+  const resumeLink = resumeHref
+    ? report.layout === "classic"
+      ? `<div class="appendix-resume"><a class="appendix-resume-link" data-role="appendix-resume" href="${esc(resumeHref)}">续抓附表入口</a></div>`
+      : `<nav class="subdocs"><a data-role="appendix-resume" class="appendix-resume-link" href="${esc(resumeHref)}">续抓附表入口</a></nav>`
+    : "";
   const content = `${reportHeader(report)}
 <p class="lead">本报告共 ${report.samples.length} 个岩芯样本，结果按检测项列出。低于检出限以“&lt; 检出限”表示，缺测以“—”表示。</p>
 ${table}
-${links}`;
+${links}
+${resumeLink}`;
   return shell(report.title, `layout-${report.layout}`, metaTags(report, snapshotId, "body"), content);
 }
 

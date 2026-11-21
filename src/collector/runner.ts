@@ -16,8 +16,15 @@ import {
   type RunEntry,
   toProgress,
   type EntryStatus,
+  type PageFragment,
 } from "./storage.js";
 import type { ProgressSnapshot } from "../shared/types.js";
+
+/**
+ * Safety bound on the number of pages walked for one report. Real long reports
+ * may exceed the legacy 50-appendix-page limit; this only stops paging loops.
+ */
+const MAX_PAGES_PER_REPORT = 200;
 
 export interface CollectorOptions {
   dataDir: string;
@@ -251,6 +258,9 @@ export class Collector {
       // writing a report and persisting its status.
       const stored = await this.store.readReport(run.snapshotId, entry.reportNo, entry.revision);
       if (stored) {
+        // Leftover fragments from the run that completed this record are
+        // obsolete; the complete report file is the durable source of truth.
+        await this.store.clearPageFragments(run.snapshotId, entry.reportNo);
         const wasDelivered = entry.status === "delivered";
         entry.status = "delivered";
         entry.sampleCount = stored.samples.length;
@@ -266,6 +276,7 @@ export class Collector {
       try {
         const record = await this.collectReport(client, run, entry);
         await this.store.writeReport(run.snapshotId, record);
+        await this.store.clearPageFragments(run.snapshotId, entry.reportNo);
         entry.status = "delivered";
         entry.sampleCount = record.samples.length;
         delete entry.reason;
@@ -326,7 +337,12 @@ export class Collector {
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= this.reportAttempts; attempt++) {
       try {
-        return await this.fetchAndMerge(client, run, entry);
+        // On the first attempt we may hold pages confirmed by an earlier
+        // process. Every later attempt follows a lost session or a rejected
+        // token, so the current session cannot use any earlier appendix
+        // token: re-enter through the body with an explicit resume entry.
+        const resumeViaBody = attempt > 1;
+        return await this.fetchAndMerge(client, run, entry, resumeViaBody);
       } catch (error) {
         lastError = error;
         const retryable =
@@ -349,34 +365,103 @@ export class Collector {
     client: SignedClient,
     run: PersistedRun,
     entry: RunEntry,
+    resumeViaBody: boolean,
   ): Promise<ReportRecord> {
-    const bodyUrl = new URL(`/reports/${encodeURIComponent(entry.reportNo)}`, run.siteUrl);
-    const parts: PagePart[] = [];
-    const seen = new Set<string>();
+    // Every page already confirmed on disk (across earlier sessions or a
+    // previous process) is trusted and never requested again. Fragments must
+    // form an ordered prefix: body (page 0) followed by appendix pages 1..N.
+    // A gap means the durable history is unusable, so the report restarts
+    // from its body and the stale fragments are overwritten as pages recur.
+    const fragments = await this.store.readPageFragments(run.snapshotId, entry.reportNo, entry.revision);
+    const confirmedPages = new Map<number, PageFragment>();
+    let contiguous = fragments.length > 0 && fragments[0]!.page === 0;
+    if (contiguous) {
+      fragments.forEach((fragment, index) => {
+        if (fragment.page !== index) contiguous = false;
+      });
+    }
+    if (contiguous) {
+      for (const fragment of fragments) confirmedPages.set(fragment.page, fragment);
+    }
+    // Session/token recovery always goes through a resume entry; a process
+    // restart resumes purely from whatever durable prefix exists.
+    const useResumeEntry = resumeViaBody || confirmedPages.size > 1;
 
-    let currentUrl: string | null = bodyUrl.toString();
-    let pagesFetched = 0;
+    const parts: PagePart[] = [];
+    const savedAt = new Date().toISOString();
+    const persist = async (page: number, url: string, html: string): Promise<void> => {
+      const fragment: PageFragment = {
+        reportNo: entry.reportNo,
+        revision: entry.revision,
+        snapshotId: run.snapshotId,
+        page,
+        url,
+        html,
+        savedAt,
+      };
+      await this.store.writePageFragment(run.snapshotId, fragment);
+      confirmedPages.set(page, fragment);
+    };
+
+    // ---- Body (page 0) -------------------------------------------------
+    const bodyUrl = new URL(`/reports/${encodeURIComponent(entry.reportNo)}`, run.siteUrl);
+    let resumePage = 0; // highest confirmed appendix page
+    let bodyPart: PagePart;
+    if (confirmedPages.has(0)) {
+      const bodyFragment = confirmedPages.get(0)!;
+      bodyPart = { url: bodyFragment.url, html: bodyFragment.html };
+      for (const page of [...confirmedPages.keys()].filter((p) => p > 0).sort((a, b) => a - b)) {
+        const fragment = confirmedPages.get(page)!;
+        parts.push({ url: fragment.url, html: fragment.html });
+        resumePage = page;
+      }
+    } else {
+      const { html, finalUrl } = await client.get(bodyUrl.toString());
+      this.assertPage(html, finalUrl, run, entry, "body");
+      await persist(0, finalUrl, html);
+      bodyPart = { url: finalUrl, html };
+    }
+    parts.unshift(bodyPart);
+
+    // ---- First appendix entry ------------------------------------------
+    // Normal crawl: follow the appendix-1 link discovered in the body, so
+    // paging entries always come from page content. Recovery/resume: ask the
+    // body for a fresh single-use token to the first unconfirmed page.
+    let currentUrl: string | null;
+    if (useResumeEntry) {
+      const resumeEntryUrl = `${bodyUrl.toString()}?resumePage=${resumePage + 1}`;
+      const { html: resumeHtml, finalUrl: resumeFinalUrl } = await client.get(resumeEntryUrl);
+      this.assertPage(resumeHtml, resumeFinalUrl, run, entry, "body");
+      const resumeParsed = parsePage(resumeHtml, {
+        expectedSnapshotId: run.snapshotId,
+        sourceUrl: resumeFinalUrl,
+      });
+      // No resume link means the confirmed prefix already covers every page.
+      currentUrl = resumeParsed.resumeLink
+        ? new URL(resumeParsed.resumeLink, resumeFinalUrl).toString()
+        : null;
+    } else {
+      const bodyParsed = parsePage(bodyPart.html, {
+        expectedSnapshotId: run.snapshotId,
+        sourceUrl: bodyPart.url,
+      });
+      currentUrl = bodyParsed.nextLink ? new URL(bodyParsed.nextLink, bodyPart.url).toString() : null;
+    }
+
+    let totalPages = parts.length;
     while (currentUrl) {
       const { html, finalUrl } = await client.get(currentUrl);
-      if (seen.has(finalUrl)) throw new ParseError(`Paging loop detected at ${finalUrl}`);
-      seen.add(finalUrl);
-      parts.push({ url: finalUrl, html });
-      pagesFetched += 1;
-      if (pagesFetched > 50) throw new ParseError(`Too many appendix pages for ${entry.reportNo}`);
-
+      this.assertPage(html, finalUrl, run, entry, "appendix");
       const parsed = parsePage(html, { expectedSnapshotId: run.snapshotId, sourceUrl: finalUrl });
-      if (parts.length > 1 && parsed.pageKind !== "appendix") {
-        throw new ParseError(`Expected an appendix page at ${finalUrl}, got another document`);
-      }
-      if (parsed.snapshotId !== run.snapshotId) {
-        throw new ParseError(
-          `Page ${finalUrl} belongs to snapshot ${parsed.snapshotId}, expected ${run.snapshotId}`,
-        );
-      }
-      if (parsed.revision !== entry.revision) {
-        throw new ParseError(
-          `Page ${finalUrl} has revision ${parsed.revision}, directory says ${entry.revision}`,
-        );
+      const pageNumber = this.appendixPageNumber(finalUrl);
+
+      // Durable confirmation happens before the in-memory merge, so a crash
+      // at any point resumes exactly after the last fsync'd page.
+      await persist(pageNumber, finalUrl, html);
+      parts.push({ url: finalUrl, html });
+      totalPages += 1;
+      if (totalPages > MAX_PAGES_PER_REPORT) {
+        throw new ParseError(`Too many appendix pages for ${entry.reportNo}`);
       }
       currentUrl = parsed.nextLink ? new URL(parsed.nextLink, finalUrl).toString() : null;
     }
@@ -392,6 +477,36 @@ export class Collector {
       ...merged.record,
       collectedAt: new Date().toISOString(),
     };
+  }
+
+  /** Parse and validate one freshly fetched page against the pinned run. */
+  private assertPage(
+    html: string,
+    finalUrl: string,
+    run: PersistedRun,
+    entry: RunEntry,
+    expectedKind: "body" | "appendix",
+  ): void {
+    const parsed = parsePage(html, { expectedSnapshotId: run.snapshotId, sourceUrl: finalUrl });
+    if (expectedKind === "appendix" && parsed.pageKind !== "appendix") {
+      throw new ParseError(`Expected an appendix page at ${finalUrl}, got another document`);
+    }
+    if (parsed.snapshotId !== run.snapshotId) {
+      throw new ParseError(
+        `Page ${finalUrl} belongs to snapshot ${parsed.snapshotId}, expected ${run.snapshotId}`,
+      );
+    }
+    if (parsed.revision !== entry.revision) {
+      throw new ParseError(
+        `Page ${finalUrl} has revision ${parsed.revision}, directory says ${entry.revision}`,
+      );
+    }
+  }
+
+  private appendixPageNumber(url: string): number {
+    const match = /\/appendix\/(\d+)(?:[?#]|$)/.exec(new URL(url).pathname);
+    if (!match) throw new ParseError(`Appendix URL has no page number: ${url}`);
+    return Number(match[1]);
   }
 
   progress(): ProgressSnapshot {

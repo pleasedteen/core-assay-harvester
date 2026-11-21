@@ -7,7 +7,7 @@ import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 import { after, describe, test } from "node:test";
@@ -17,6 +17,8 @@ import type { ReportRecord, Sample } from "../src/shared/types.js";
 import { MockAssaySite } from "../src/site/server.js";
 import {
   armFault,
+  appendixPageRequestCounts,
+  appendixRequestCounts,
   assertNoDuplicateReports,
   bodyRequestCounts,
   download,
@@ -533,10 +535,20 @@ describe("process restart", () => {
       assert.equal(record.revision, 1);
     }
 
-    // Reports already complete on disk were never requested again.
-    const counts = bodyRequestCounts(await siteRequests(site.url));
+    // Reports already complete on disk were never crawled again: not their
+    // body for content, and none of their appendix pages were re-requested.
+    // A resume re-entry body call (a fresh token handoff for another report)
+    // never happens for fully delivered reports, so the body count stays one.
+    const allRequests = await siteRequests(site.url);
+    const counts = bodyRequestCounts(allRequests);
+    const appendixCounts = appendixRequestCounts(allRequests);
     for (const reportNo of deliveredBeforeKill) {
-      assert.equal(counts.get(reportNo), 1, `${reportNo} was refetched after restart`);
+      assert.equal(counts.get(reportNo), 1, `${reportNo} body was refetched after restart`);
+      assert.equal(
+        appendixCounts.get(reportNo) ?? 0,
+        expectedAppendixPages(reportNo),
+        `${reportNo} appendix pages were refetched after restart`,
+      );
     }
 
     // Every request of the resumed run stayed in the original snapshot.
@@ -560,11 +572,248 @@ describe("process restart", () => {
   });
 });
 
+describe("long appendix reports", () => {
+  // 54 samples => body (2) + 52 appendix pages, beyond the legacy 50-page cap.
+  const LONG_SAMPLES = 54;
+  const LONG_PAGES = LONG_SAMPLES - 2;
+  const LONG_REPORT = "R-0006";
+
+  test("collects a report with more than 50 appendix pages end to end", async () => {
+    const h = await harness({ longReportSamples: LONG_SAMPLES });
+
+    await startCollect(h.service.url, h.site.url);
+    const progress = await waitForState(h.service.url, ["complete", "failed"], 30_000);
+    assert.equal(progress.state, "complete", progress.lastError ?? "");
+
+    const result = await download(h.service.url);
+    assert.equal(result.status, 200);
+    assert.equal(result.records.length, 6);
+    const longRecord = result.records.find((record) => record.reportNo === LONG_REPORT)!;
+    assert.equal(longRecord.samples.length, LONG_SAMPLES);
+    assert.equal(longRecord.source.appendixUrls.length, LONG_PAGES);
+    assert.ok(LONG_PAGES > 50, "fixture must really exceed 50 appendix pages");
+
+    // Every appendix page URL is distinct and ordered 1..N.
+    longRecord.source.appendixUrls.forEach((url, index) => {
+      assert.match(url, new RegExp(`/appendix/${index + 1}\\?token=`));
+    });
+    // Every sample is present exactly once with a real page provenance.
+    const sampleIds = new Set(longRecord.samples.map((sample) => sample.sampleId));
+    assert.equal(sampleIds.size, LONG_SAMPLES);
+    assert.ok(longRecord.samples.every((sample) => /\/reports\/R-0006(\/appendix\/\d+)?/.test(sample.sourceUrl)));
+
+    // The site saw exactly one successful request per appendix page.
+    const perPage = appendixPageRequestCounts(await siteRequests(h.site.url), LONG_REPORT);
+    assert.equal(perPage.size, LONG_PAGES);
+    for (let page = 1; page <= LONG_PAGES; page++) {
+      assert.equal(perPage.get(page), 1, `page ${page} requested an unexpected number of times`);
+    }
+  });
+
+  test("tail disconnection resumes from page-discovered entries without re-requesting confirmed pages", async () => {
+    const h = await harness({ longReportSamples: LONG_SAMPLES });
+    // Stretch the appendix walk so the injected drop lands deterministically.
+    await armFault(h.site.url, { type: "delay", matchPath: "/appendix/", ms: 8, times: 500 });
+    // Drop the response of the 50th appendix page (deep in the tail). The
+    // server accepts the request, consuming its nonce and single-use token,
+    // then destroys the socket before any byte is written.
+    await armFault(h.site.url, {
+      type: "dropResponse",
+      matchPath: `/reports/${LONG_REPORT}/appendix/50`,
+      times: 1,
+    });
+
+    await startCollect(h.service.url, h.site.url);
+    const progress = await waitForState(h.service.url, ["complete", "failed"], 30_000);
+    assert.equal(progress.state, "complete", progress.lastError ?? "");
+
+    const result = await download(h.service.url);
+    const longRecord = result.records.find((record) => record.reportNo === LONG_REPORT)!;
+    assert.equal(longRecord.samples.length, LONG_SAMPLES);
+    assert.equal(longRecord.source.appendixUrls.length, LONG_PAGES);
+    assertNoDuplicateReports(result.records);
+
+    const requests = await siteRequests(h.site.url);
+    assert.ok(requests.some((request) => request.note === "fault_drop_response"), "drop fault must fire");
+
+    // Page 50 was requested twice (once dropped, once delivered); every other
+    // appendix page exactly once. Confirmed pages 1..49 were never re-walked.
+    const perPage = appendixPageRequestCounts(requests, LONG_REPORT);
+    for (let page = 1; page <= LONG_PAGES; page++) {
+      const expected = page === 50 ? 2 : 1;
+      assert.equal(perPage.get(page), expected, `page ${page} requested ${perPage.get(page)} times`);
+    }
+
+    // Recovery used a resume re-entry through the body (fresh session token),
+    // not a replay of the consumed page-50 token.
+    const resumeEntries = requests.filter(
+      (request) => request.note === "report_body" && request.url.includes("resumePage=50"),
+    );
+    assert.ok(resumeEntries.length >= 1, "expected a resume entry reissuing the page-50 token");
+    const replayRejections = requests.filter((request) => request.note === "token_replayed");
+    assert.equal(replayRejections.length, 0, "the consumed token must never be replayed");
+
+    // The replacement session stayed inside the original pinned snapshot.
+    const sessions = h.site.state().sessions;
+    assert.ok(sessions.every((session) => session.snapshotId === progress.snapshotId));
+  });
+
+  test("process killed in the tail resumes with only unconfirmed pages, then completes the snapshot", async () => {
+    const site = await MockAssaySite.start({ longReportSamples: LONG_SAMPLES });
+    cleanup.push(() => site.close());
+    const dataDir = await tempDataDir("long-restart");
+    const port = await freePort();
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    // Only slow the long report's appendix so the other five reports finish
+    // quickly and the kill reliably lands inside the long tail. The delay is
+    // sized to leave a wide margin between the kill threshold (30 confirmed
+    // pages) and the last page, even when the test process is scheduled late.
+    await armFault(site.url, {
+      type: "delay",
+      matchPath: `/reports/${LONG_REPORT}/appendix/`,
+      ms: 25,
+      times: 500,
+    });
+
+    const childEntry = await buildCollectorEntry();
+    let launched = spawnCollector(childEntry, dataDir, port, site.url);
+    await launched.ready;
+    let child = launched.child;
+
+    const startResponse = await startCollect(baseUrl, site.url);
+    assert.equal(startResponse.status, 202);
+    const started = (await startResponse.json()) as { snapshotId: string };
+    const snapshotId = started.snapshotId;
+
+    // Wait until durable page fragments show the walk is well inside the
+    // appendix (30 confirmed pages) but clearly not finished. At 25ms per
+    // page the remaining ~22 pages need roughly half a second, giving the
+    // kill a comfortable margin under scheduling jitter.
+    const checkpointDir = path.join(
+      dataDir,
+      "snapshots",
+      snapshotId,
+      "checkpoints",
+      LONG_REPORT,
+    );
+    await waitUntil(async () => (await countFiles(checkpointDir)) >= 30, 30_000);
+    const fragmentsAtKill = await listFragmentPages(checkpointDir);
+    assert.ok(fragmentsAtKill.length >= 30);
+    const highestConfirmed = Math.max(...fragmentsAtKill);
+    assert.ok(highestConfirmed < LONG_PAGES, "long report must still be incomplete at kill time");
+
+    child.kill("SIGKILL");
+    await waitForExit(child);
+
+    // A new revision is published while the collector is down. The resuming
+    // run must still finish and deliver the original snapshot.
+    const newer = await publish(site.url, { reportNos: [LONG_REPORT] });
+    assert.notEqual(newer.id, snapshotId);
+    await fetch(`${site.url}/__control/faults/clear`, { method: "POST" });
+
+    launched = spawnCollector(childEntry, dataDir, port, site.url);
+    await launched.ready;
+    child = launched.child;
+
+    const interrupted = await getProgress(baseUrl);
+    assert.equal(interrupted.progress.state, "interrupted");
+    assert.equal(interrupted.progress.snapshotId, snapshotId);
+
+    // Mark the request log boundary so post-restart requests can be isolated.
+    const requestsBeforeResume = (await siteRequests(site.url)).length;
+    const resumeResponse = await startCollect(baseUrl, site.url);
+    assert.equal(resumeResponse.status, 202);
+    const resumed = await waitForState(baseUrl, ["complete", "failed"], 30_000);
+    assert.equal(resumed.state, "complete", resumed.lastError ?? "");
+    assert.equal(resumed.snapshotId, snapshotId, "must finish the original snapshot, not the new revision");
+
+    const result = await download(baseUrl);
+    assert.equal(result.status, 200);
+    assert.equal(result.headers.get("x-snapshot-id"), snapshotId);
+    const longRecord = result.records.find((record) => record.reportNo === LONG_REPORT)!;
+    assert.equal(longRecord.revision, 1, "new revision must not mix into the delivered snapshot");
+    assert.equal(longRecord.samples.length, LONG_SAMPLES);
+    assert.equal(longRecord.source.appendixUrls.length, LONG_PAGES);
+
+    // After the restart, only pages not confirmed before the kill are asked
+    // for; the durable prefix is never re-requested.
+    const postRestart = (await siteRequests(site.url)).slice(requestsBeforeResume);
+    const perPageAfter = appendixPageRequestCounts(postRestart, LONG_REPORT);
+    for (let page = 1; page <= LONG_PAGES; page++) {
+      if (page <= highestConfirmed) {
+        assert.equal(
+          perPageAfter.get(page) ?? 0,
+          0,
+          `confirmed page ${page} was re-requested after restart`,
+        );
+      } else {
+        assert.equal(perPageAfter.get(page), 1, `unconfirmed page ${page} must be fetched once`);
+      }
+    }
+    // Re-entry happens through a body resume link for the first missing page.
+    assert.ok(
+      postRestart.some(
+        (request) => request.note === "report_body" && request.url.includes(`resumePage=${highestConfirmed + 1}`),
+      ),
+      "resume must enter at the first unconfirmed page",
+    );
+    // Nothing after the restart left the pinned snapshot.
+    assert.equal(
+      postRestart.filter((request) => request.snapshotId !== snapshotId && request.url.includes("/reports/")).length,
+      0,
+    );
+
+    // Checkpoints are cleaned up once the merged report record is published.
+    assert.equal(await countFiles(checkpointDir), 0);
+
+    child.kill("SIGTERM");
+    await waitForExit(child);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // helpers local to this file
 
-async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+async function countFiles(dir: string): Promise<number> {
+  try {
+    return (await readdir(dir)).length;
+  } catch {
+    return 0;
+  }
+}
+
+/** Parse the page numbers of durable page-NNNN.json fragments in a checkpoint dir. */
+async function listFragmentPages(dir: string): Promise<number[]> {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return [];
+  }
+  return names
+    .map((name) => /^page-(\d+)\.json$/.exec(name))
+    .filter((match): match is RegExpExecArray => match !== null)
+    .map((match) => Number(match[1]));
+}
+
+/** Appendix pages for the default seed: body always holds two samples. */
+function expectedAppendixPages(reportNo: string, longReportSamples?: number): number {
+  if (longReportSamples !== undefined && reportNo === "R-0006") {
+    return Math.max(0, longReportSamples - 2);
+  }
+  const defaultSamples: Record<string, number> = {
+    "R-0001": 4,
+    "R-0002": 3,
+    "R-0003": 2,
+    "R-0004": 4,
+    "R-0005": 3,
+    "R-0006": 5,
+  };
+  return Math.max(0, (defaultSamples[reportNo] ?? 2) - 2);
+}
+
+async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await predicate()) return;
     await sleep(25);
